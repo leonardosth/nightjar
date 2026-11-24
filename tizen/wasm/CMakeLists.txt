@@ -29,10 +29,17 @@ if(EMSCRIPTEN)
     if(ENABLE_MOONLIGHT_TRANSPORT AND EXISTS "${MOONLIGHT_COMMON_C_DIR}/src/Limelight.h")
         set(ML_DIR "${MOONLIGHT_COMMON_C_DIR}")
 
-        file(GLOB ML_RS_SOURCES "${ML_DIR}/reedsolomon/*.c")
-        add_library(moonlight_rs STATIC ${ML_RS_SOURCES})
-        target_include_directories(moonlight_rs PUBLIC "${ML_DIR}/reedsolomon")
-        target_compile_features(moonlight_rs PUBLIC c_std_99)
+        add_library(moonlight_rs STATIC
+            "${ML_DIR}/nanors/rs.c"
+            "${ML_DIR}/nanors/deps/obl/oblas_common.c"
+            "${ML_DIR}/nanors/deps/obl/oblas_lite.c"
+        )
+        target_include_directories(moonlight_rs PUBLIC
+            "${ML_DIR}/nanors"
+            "${ML_DIR}/nanors/deps"
+            "${ML_DIR}/nanors/deps/obl"
+        )
+        target_compile_features(moonlight_rs PUBLIC c_std_11)
 
         add_library(moonlight_enet STATIC
             "${ML_DIR}/enet/callbacks.c"
@@ -54,13 +61,18 @@ if(EMSCRIPTEN)
 
         file(GLOB ML_CORE_SOURCES "${ML_DIR}/src/*.c")
         add_library(moonlight_common_c STATIC ${ML_CORE_SOURCES})
-        target_compile_definitions(moonlight_common_c PUBLIC LC_CHROME)
+        target_compile_definitions(moonlight_common_c PUBLIC
+            LC_CHROME
+            HAS_SOCKLEN_T=1
+        )
         target_include_directories(moonlight_common_c PUBLIC
             "${ML_DIR}/src"
             "${ML_DIR}/enet/include"
-            "${ML_DIR}/reedsolomon"
+            "${ML_DIR}/nanors"
+            "${ML_DIR}/nanors/deps"
+            "${ML_DIR}/nanors/deps/obl"
         )
-        target_compile_features(moonlight_common_c PUBLIC c_std_99)
+        target_compile_features(moonlight_common_c PUBLIC c_std_11)
         set_target_properties(moonlight_common_c PROPERTIES
             COMPILE_FLAGS "-s USE_CRYPTO=1 -s USE_SSL=1"
         )

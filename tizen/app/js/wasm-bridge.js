@@ -19,19 +19,133 @@ import {
   fieldOfView,
 } from './frame-warp.js';
 
+const STORAGE_IDENTITY = 'nightjar.tizen.identity.v1';
+
 export async function detectWasmEngine() {
-  if (typeof window !== 'undefined' && window.NightjarWasm) {
-    return { available: true, runtime: window.NightjarWasm };
-  }
   try {
     const resp = await fetch('wasm/nightjar_tizen.js', { method: 'HEAD' });
-    if (resp.ok) {
-      return { available: true, runtime: null, scriptUrl: 'wasm/nightjar_tizen.js' };
+    if (!resp.ok) return { available: false, runtime: null };
+
+    await new Promise((resolve, reject) => {
+      if (window.NightjarWasmModule) {
+        resolve();
+        return;
+      }
+      const script = document.createElement('script');
+      script.src = 'wasm/nightjar_tizen.js';
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+
+    if (typeof window.NightjarWasmModule !== 'function') {
+      return { available: false, runtime: null };
     }
+    const mod = await window.NightjarWasmModule({
+      canvas: document.getElementById('stream-canvas'),
+    });
+
+    // Initialize or restore persistent RSA-2048/X.509 client identity
+    let stored = { uniqueId: '', certPem: '', keyPem: '' };
+    try {
+      const raw = localStorage.getItem(STORAGE_IDENTITY);
+      if (raw) stored = JSON.parse(raw);
+    } catch {
+      // ignore
+    }
+    const idJson = mod.initIdentity(stored.uniqueId || '', stored.certPem || '', stored.keyPem || '');
+    try {
+      localStorage.setItem(STORAGE_IDENTITY, idJson);
+    } catch {
+      // ignore
+    }
+
+    return { available: true, runtime: mod };
   } catch {
-    // Not built yet
+    return { available: false, runtime: null };
   }
-  return { available: false, runtime: null };
+}
+
+export class WasmStreamSession {
+  constructor(runtime, host, appId, settings) {
+    this.runtime = runtime;
+    this.host = host;
+    this.appId = appId;
+    this.settings = settings;
+    this.enabled = Boolean(settings.fwEnabled);
+    this._timer = null;
+  }
+
+  start(onStats) {
+    const [w, h] = String(this.settings.resolution || '3840x2160').split('x').map(Number);
+    const ok = this.runtime.startStream(
+      this.host.address,
+      this.appId || 0,
+      false,
+      w || 3840,
+      h || 2160,
+      Number(this.settings.fps) || 120,
+      this.settings.codec || 'hevc',
+      Number(this.settings.bitrate) || 100,
+      this.enabled,
+      Boolean(this.settings.fwLens),
+      Number(this.settings.fwMaskWidth) || 1024
+    );
+    if (!ok) {
+      throw new Error(this.runtime.lastError ? this.runtime.lastError() : 'Failed to start WASM stream');
+    }
+
+    this._timer = setInterval(() => {
+      if (!onStats || !this.runtime.getFrameWarpStatus) return;
+      try {
+        const st = JSON.parse(this.runtime.getFrameWarpStatus());
+        onStats({
+          session: `${this.host.name} (${this.settings.resolution}@${this.settings.fps} ${this.settings.codec.toUpperCase()})`,
+          enabled: this.enabled && Boolean(st.negotiated),
+          locked: Boolean(st.locked),
+          pixels: [st.pxX || 0, st.pxY || 0],
+          peak: st.peak || 0,
+          fov: st.fov > 0 ? st.fov : null,
+          maskCells: st.maskCells || 0,
+          warped: st.warped || 0,
+          extrapolated: st.extrapolated || 0,
+          untagged: st.untagged || 0,
+        });
+      } catch {
+        // ignore
+      }
+    }, 100);
+  }
+
+  setFrameWarpEnabled(enabled) {
+    this.enabled = enabled;
+    if (this.runtime.setFrameWarpEnabled) this.runtime.setFrameWarpEnabled(enabled);
+  }
+
+  sendMouse(dx, dy) {
+    if (this.runtime.sendMouse) this.runtime.sendMouse(dx, dy);
+  }
+
+  sendController(index, state) {
+    if (this.runtime.sendController) {
+      this.runtime.sendController(
+        index,
+        state.buttons | 0,
+        state.leftTrigger & 0xff,
+        state.rightTrigger & 0xff,
+        state.leftStickX | 0,
+        state.leftStickY | 0,
+        state.rightStickX | 0,
+        state.rightStickY | 0
+      );
+    }
+  }
+
+  stop() {
+    if (this._timer) clearInterval(this._timer);
+    this._timer = null;
+    if (this.runtime.stopStream) this.runtime.stopStream();
+  }
 }
 
 /**

@@ -1,11 +1,13 @@
 #include "frame_warp_predictor.hpp"
 #include "frame_warp_protocol.hpp"
+#include "host_http_client.hpp"
 
 #include <cassert>
 #include <cmath>
 #include <iostream>
 
 using namespace nightjar::frame_warp;
+using namespace nightjar::tizen;
 
 int main() {
     // 1. Request encode/decode
@@ -57,13 +59,21 @@ int main() {
     pred.note_mouse(50, 0, 10000);
     Tags tags{7, {Tag{10, 20, 0, 0, kHeldNone}}};
     pred.on_tags(tags, 10000);
-    // Ramp fade over 150ms
     (void)pred.warp(10, 10000);
     auto w = pred.warp(10, 160000);
     assert(w.active);
-    // delta mouse = 30, gain = -2 => -60 px flat, with focal=960 => 960 * tan(-60/960) ~= -60.08 px
     assert(w.pixels[0] < -59.0f && w.pixels[0] > -61.5f);
 
-    std::cout << "All C++ Frame Warp tests passed!\n";
+    // 5. XML parsing for /serverinfo (<FrameWarpVersion>) & /applist
+    std::string server_xml = "<root><hostname>Rubylight-PC</hostname><FrameWarpVersion>1</FrameWarpVersion></root>";
+    assert(HostHttpClient::parse_frame_warp_version(server_xml) == 1);
+    assert(HostHttpClient::parse_frame_warp_version("<root><FrameWarpVersion>0</FrameWarpVersion></root>") == 0);
+    assert(HostHttpClient::parse_frame_warp_version("<root></root>") == 0);
+
+    std::string apps_xml = "<root><App><ID>101</ID><AppTitle>Desktop</AppTitle><IsHdrSupported>1</IsHdrSupported></App></root>";
+    auto apps = HostHttpClient::parse_applist_xml(apps_xml);
+    assert(apps.size() == 1 && apps[0].id == 101 && apps[0].title == "Desktop" && apps[0].hdr_supported);
+
+    std::cout << "All C++ Frame Warp & HostHttpClient tests passed!\n";
     return 0;
 }

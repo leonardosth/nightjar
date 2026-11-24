@@ -4,7 +4,7 @@
 
 import { WarpRenderer } from './warp-renderer.js';
 import { InputManager } from './input-manager.js';
-import { detectWasmEngine, FrameWarpDemoSession } from './wasm-bridge.js';
+import { detectWasmEngine, FrameWarpDemoSession, WasmStreamSession } from './wasm-bridge.js';
 
 const STORAGE_HOSTS = 'nightjar.tizen.hosts.v1';
 const STORAGE_SETTINGS = 'nightjar.tizen.settings.v1';
@@ -303,18 +303,42 @@ class NightjarTizenApp {
   }
 
   connectHost(host) {
-    if (this.wasm.available && this.wasm.runtime && this.wasm.runtime.startStream) {
-      this._enterStreamView();
-      this.wasm.runtime.startStream({
-        address: host.address,
-        resolution: this.settings.resolution,
-        fps: Number(this.settings.fps),
-        codec: this.settings.codec,
-        bitrateMbps: Number(this.settings.bitrate),
-        frameWarp: Boolean(this.settings.fwEnabled),
-        frameWarpLens: Boolean(this.settings.fwLens),
-        frameWarpMaskWidth: Number(this.settings.fwMaskWidth),
-      });
+    if (this.wasm.available && this.wasm.runtime && this.wasm.runtime.probeHost) {
+      const probe = JSON.parse(this.wasm.runtime.probeHost(host.address));
+      if (probe.error) {
+        alert(`Could not reach ${host.address}: ${probe.error}`);
+        return;
+      }
+      host.frameWarpVersion = probe.frameWarpVersion || 0;
+      host.paired = Boolean(probe.paired);
+      if (probe.hostname) host.name = probe.hostname;
+      this._saveHosts();
+      this._renderHosts();
+
+      if (!host.paired) {
+        const pin = String(Math.floor(1000 + Math.random() * 9000));
+        alert(`Enter PIN ${pin} in Rubylight / Sunshine on ${host.name}, then press OK.`);
+        const pairRes = JSON.parse(this.wasm.runtime.pairHost(host.address, pin));
+        if (!pairRes.ok) {
+          alert(`Pairing failed: ${pairRes.error}`);
+          return;
+        }
+        host.paired = true;
+        this._saveHosts();
+        this._renderHosts();
+      }
+
+      const appRes = JSON.parse(this.wasm.runtime.listApps(host.address));
+      const appId = appRes.apps && appRes.apps.length > 0 ? appRes.apps[0].id : 0;
+
+      try {
+        this._enterStreamView();
+        this.session = new WasmStreamSession(this.wasm.runtime, host, appId, this.settings);
+        this.session.start((stats) => this._updateOverlay(stats));
+      } catch (err) {
+        this.stopStream();
+        alert(`Stream failed: ${err.message}`);
+      }
     } else {
       // Launch interactive Frame Warp Lab when native WASM binary is not yet bundled
       this.startDemoStream();

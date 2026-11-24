@@ -52,7 +52,11 @@ Write-Host "==> Built signed package: $($WgtFile.FullName)" -ForegroundColor Gre
 if ($TvIp -ne "") {
     Write-Host "==> Connecting to Samsung TV at $TvIp..." -ForegroundColor Cyan
     & sdb connect "${TvIp}:26101"
-    & tizen install -n $WgtFile.Name -t "${TvIp}:26101" -- $DistDir
+    $DevLine = (& sdb devices | Select-String -Pattern ([regex]::Escape("${TvIp}:26101")) | Select-Object -First 1).ToString()
+    $TargetName = ($DevLine -split "\s+")[-1]
+    if (-not $TargetName) { $TargetName = "${TvIp}:26101" }
+    Write-Host "==> Installing $($WgtFile.Name) to target $TargetName..." -ForegroundColor Cyan
+    & tizen install -n $WgtFile.Name -t $TargetName -- $DistDir
     if ($LASTEXITCODE -ne 0) { throw "tizen install failed." }
-    Write-Host "==> Installed Nightjar on Samsung TV ($TvIp)!" -ForegroundColor Green
+    Write-Host "==> Installed Nightjar on Samsung TV ($TargetName / $TvIp)!" -ForegroundColor Green
 }

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.10)
 project(nightjar_tizen_wasm LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -13,11 +13,9 @@ add_library(nightjar_frame_warp STATIC
 target_include_directories(nightjar_frame_warp PUBLIC src)
 
 if(EMSCRIPTEN)
-    include(FetchContent)
-    find_program(PYTHON3_BIN NAMES python3 python REQUIRED)
-
     option(TIZEN_WASM_SDK "Enable Samsung Tizen WASM Player (kVideoTexture) & Sockets Extension" ON)
-    option(ENABLE_MOONLIGHT_TRANSPORT "Fetch and link moonlight-common-c with Frame Warp v1 hooks" ON)
+    option(ENABLE_MOONLIGHT_TRANSPORT "Link pre-fetched moonlight-common-c with Frame Warp v1 hooks" ON)
+    set(MOONLIGHT_COMMON_C_DIR "/opt/moonlight-common-c" CACHE PATH "Path to patched moonlight-common-c")
 
     add_compile_options(-w -s WASM=1 -Os -DSAMSUNG_WRT -DOS_WASM -DNDEBUG)
 
@@ -28,25 +26,8 @@ if(EMSCRIPTEN)
         list(APPEND NIGHTJAR_WASM_DEFS TIZEN_WASM_SDK=1)
     endif()
 
-    if(ENABLE_MOONLIGHT_TRANSPORT)
-        FetchContent_Declare(
-            moonlight_common_c
-            GIT_REPOSITORY https://github.com/moonlight-stream/moonlight-common-c.git
-            GIT_TAG        master
-            GIT_SHALLOW    TRUE
-            GIT_SUBMODULES_RECURSE TRUE
-        )
-        FetchContent_Populate(moonlight_common_c)
-
-        execute_process(
-            COMMAND "${PYTHON3_BIN}" "${CMAKE_SOURCE_DIR}/scripts/patch_moonlight_frame_warp.py" "${moonlight_common_c_SOURCE_DIR}"
-            RESULT_VARIABLE PATCH_RES
-        )
-        if(NOT PATCH_RES EQUAL 0)
-            message(FATAL_ERROR "Failed to patch moonlight-common-c with Frame Warp v1 hooks")
-        endif()
-
-        set(ML_DIR "${moonlight_common_c_SOURCE_DIR}")
+    if(ENABLE_MOONLIGHT_TRANSPORT AND EXISTS "${MOONLIGHT_COMMON_C_DIR}/src/Limelight.h")
+        set(ML_DIR "${MOONLIGHT_COMMON_C_DIR}")
 
         file(GLOB ML_RS_SOURCES "${ML_DIR}/reedsolomon/*.c")
         add_library(moonlight_rs STATIC ${ML_RS_SOURCES})
@@ -89,6 +70,7 @@ if(EMSCRIPTEN)
     endif()
 
     add_executable(nightjar_tizen
+        src/libchelper.c
         src/host_http_client.cpp
         src/tizen_video_decoder.cpp
         src/warp_gl_renderer.cpp
@@ -113,8 +95,6 @@ if(EMSCRIPTEN)
         "-s NO_EXIT_RUNTIME=1"
         "-s USE_PTHREADS=1"
         "-s PTHREAD_POOL_SIZE=12"
-        "-s USE_WEBGL2=1"
-        "-s FULL_ES3=1"
         "-s WASM=1"
         "-s MODULARIZE=1"
         "-s EXPORT_NAME=NightjarWasmModule"

@@ -8,67 +8,46 @@ namespace nightjar::tizen {
 #ifdef __EMSCRIPTEN__
 namespace {
 
-constexpr const char* kVertSrc = R"(#version 300 es
-precision highp float;
-const vec2 POSITIONS[4] = vec2[4](
-    vec2(-1.0, -1.0),
-    vec2( 1.0, -1.0),
-    vec2(-1.0,  1.0),
-    vec2( 1.0,  1.0)
-);
-const vec2 TEXCOORDS[4] = vec2[4](
-    vec2(0.0, 0.0),
-    vec2(1.0, 0.0),
-    vec2(0.0, 1.0),
-    vec2(1.0, 1.0)
-);
-out vec2 vUv;
-void main() {
-    gl_Position = vec4(POSITIONS[gl_VertexID], 0.0, 1.0);
-    vUv = TEXCOORDS[gl_VertexID];
-}
-)";
+constexpr const char* kVertSrc =
+    "attribute vec2 aPos;\n"
+    "attribute vec2 aUv;\n"
+    "varying vec2 vUv;\n"
+    "void main() {\n"
+    "    vUv = aUv;\n"
+    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+    "}\n";
 
-constexpr const char* kFragSrc = R"(#version 300 es
-precision highp float;
-uniform highp sampler2D uVideo;
-uniform lowp sampler2D uHudMask;
-uniform vec3 uWarp;
-uniform vec4 uLens;
-uniform vec4 uWarpRect;
-uniform float uVideoTopDown;
-in vec2 vUv;
-out vec4 fragColor;
-
-vec2 pictureToVideoUv(vec2 picture) {
-    vec2 cropped = uWarpRect.xy + clamp(picture, 0.0, 1.0) * uWarpRect.zw;
-    return uVideoTopDown > 0.5 ? cropped : vec2(cropped.x, 1.0 - cropped.y);
-}
-
-void main() {
-    vec2 picture = vec2(vUv.x, 1.0 - vUv.y);
-    vec2 samplePic = picture;
-    float fade = 1.0;
-
-    if (uWarp.x != 0.0 || uWarp.y != 0.0) {
-        bool hud = (uWarp.z > 0.5) && (texture(uHudMask, picture).r > 0.5);
-        if (!hud) {
-            vec2 q = picture - 0.5;
-            vec2 p = 0.5 + (q * uLens.zw - uWarp.xy) / max(1.0 + dot(q, uLens.xy), 0.25);
-            vec2 outside = max(-p, p - 1.0);
-            float edgeFade = 1.0 - 0.35 * clamp(max(max(outside.x, outside.y), 0.0) / 0.08, 0.0, 1.0);
-            p = 1.0 - abs(1.0 - abs(p));
-            if (uWarp.z <= 0.5 || texture(uHudMask, p).r <= 0.5) {
-                fade = edgeFade;
-                samplePic = clamp(p, 0.0, 1.0);
-            }
-        }
-    }
-
-    vec2 videoUv = pictureToVideoUv(samplePic);
-    fragColor = vec4(texture(uVideo, videoUv).rgb * fade, 1.0);
-}
-)";
+// Exact Nightjar Frame Warp v1 shader adapted for Samsung Tizen's GL_TEXTURE_EXTERNAL_OES
+constexpr const char* kFragSrc =
+    "#extension GL_OES_EGL_image_external : require\n"
+    "precision highp float;\n"
+    "uniform samplerExternalOES uVideo;\n"
+    "uniform lowp sampler2D uHudMask;\n"
+    "uniform vec3 uWarp;\n"
+    "uniform vec4 uLens;\n"
+    "uniform vec4 uWarpRect;\n"
+    "varying vec2 vUv;\n"
+    "void main() {\n"
+    "    vec2 picture = vec2(vUv.x, 1.0 - vUv.y);\n"
+    "    vec2 samplePic = picture;\n"
+    "    float fade = 1.0;\n"
+    "    if (uWarp.x != 0.0 || uWarp.y != 0.0) {\n"
+    "        bool hud = (uWarp.z > 0.5) && (texture2D(uHudMask, picture).r > 0.5);\n"
+    "        if (!hud) {\n"
+    "            vec2 q = picture - 0.5;\n"
+    "            vec2 p = 0.5 + (q * uLens.zw - uWarp.xy) / max(1.0 + dot(q, uLens.xy), 0.25);\n"
+    "            vec2 outside = max(-p, p - 1.0);\n"
+    "            float edgeFade = 1.0 - 0.35 * clamp(max(max(outside.x, outside.y), 0.0) / 0.08, 0.0, 1.0);\n"
+    "            p = 1.0 - abs(1.0 - abs(p));\n"
+    "            if (uWarp.z <= 0.5 || texture2D(uHudMask, p).r <= 0.5) {\n"
+    "                fade = edgeFade;\n"
+    "                samplePic = clamp(p, 0.0, 1.0);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    vec2 cropped = uWarpRect.xy + clamp(samplePic, 0.0, 1.0) * uWarpRect.zw;\n"
+    "    gl_FragColor = vec4(texture2D(uVideo, cropped).rgb * fade, 1.0);\n"
+    "}\n";
 
 GLuint compile_shader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
@@ -106,22 +85,31 @@ bool WarpGlRenderer::init(int width, int height) {
     glGetProgramiv(program_, GL_LINK_STATUS, &linked);
     if (!linked) return false;
 
-    glGenVertexArrays(1, &vao_);
+    static const float kQuad[] = {
+        -1.0f, -1.0f, 0.0f, 0.0f,
+         1.0f, -1.0f, 1.0f, 0.0f,
+        -1.0f,  1.0f, 0.0f, 1.0f,
+         1.0f,  1.0f, 1.0f, 1.0f,
+    };
+    glGenBuffers(1, &vbo_);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(kQuad), kQuad, GL_STATIC_DRAW);
 
+    a_pos_ = glGetAttribLocation(program_, "aPos");
+    a_uv_ = glGetAttribLocation(program_, "aUv");
     u_video_ = glGetUniformLocation(program_, "uVideo");
     u_hud_mask_ = glGetUniformLocation(program_, "uHudMask");
     u_warp_ = glGetUniformLocation(program_, "uWarp");
     u_lens_ = glGetUniformLocation(program_, "uLens");
     u_warp_rect_ = glGetUniformLocation(program_, "uWarpRect");
-    u_video_top_down_ = glGetUniformLocation(program_, "uVideoTopDown");
 
     glGenTextures(1, &video_tex_);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, video_tex_);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, video_tex_);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glGenTextures(1, &mask_tex_);
     glActiveTexture(GL_TEXTURE1);
@@ -131,7 +119,7 @@ bool WarpGlRenderer::init(int width, int height) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     uint8_t zero = 0;
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 1, 1, 0, GL_RED, GL_UNSIGNED_BYTE, &zero);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 1, 1, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, &zero);
 
     resize(width, height);
     return true;
@@ -173,12 +161,12 @@ void WarpGlRenderer::sync_hud_mask(frame_warp::FrameWarp& warp) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     if (!updated) {
         uint8_t zero = 0;
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 1, 1, 0, GL_RED, GL_UNSIGNED_BYTE, &zero);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 1, 1, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, &zero);
         known_mask_gen_.reset();
         has_mask_ = false;
     } else {
         auto r8 = updated->pack_r8();
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, updated->width, updated->height, 0, GL_RED, GL_UNSIGNED_BYTE, r8.data());
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, updated->width, updated->height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, r8.data());
         known_mask_gen_ = updated->generation;
         has_mask_ = true;
     }
@@ -188,10 +176,14 @@ void WarpGlRenderer::sync_hud_mask(frame_warp::FrameWarp& warp) {
 void WarpGlRenderer::draw(const frame_warp::Warp& w, uint32_t frame_number, uint32_t input_seq) {
 #ifdef __EMSCRIPTEN__
     glUseProgram(program_);
-    glBindVertexArray(vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
+    glEnableVertexAttribArray(static_cast<GLuint>(a_pos_));
+    glVertexAttribPointer(static_cast<GLuint>(a_pos_), 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(0));
+    glEnableVertexAttribArray(static_cast<GLuint>(a_uv_));
+    glVertexAttribPointer(static_cast<GLuint>(a_uv_), 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(2 * sizeof(float)));
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, video_tex_);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, video_tex_);
     glUniform1i(u_video_, 0);
 
     glActiveTexture(GL_TEXTURE1);
@@ -203,7 +195,6 @@ void WarpGlRenderer::draw(const frame_warp::Warp& w, uint32_t frame_number, uint
     const auto& l = w.active ? w.lens : frame_warp::kFlatLens;
     glUniform4f(u_lens_, l[0], l[1], l[2], l[3]);
     glUniform4f(u_warp_rect_, warp_rect_[0], warp_rect_[1], warp_rect_[2], warp_rect_[3]);
-    glUniform1f(u_video_top_down_, 0.0f);
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 #endif
@@ -233,7 +224,7 @@ void WarpGlRenderer::destroy() {
 #ifdef __EMSCRIPTEN__
     if (video_tex_) { glDeleteTextures(1, &video_tex_); video_tex_ = 0; }
     if (mask_tex_) { glDeleteTextures(1, &mask_tex_); mask_tex_ = 0; }
-    if (vao_) { glDeleteVertexArrays(1, &vao_); vao_ = 0; }
+    if (vbo_) { glDeleteBuffers(1, &vbo_); vbo_ = 0; }
     if (program_) { glDeleteProgram(program_); program_ = 0; }
 #endif
 }

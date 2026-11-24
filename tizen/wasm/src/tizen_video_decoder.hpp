@@ -2,12 +2,13 @@
 
 #include "frame_warp_predictor.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
 
 #ifdef __EMSCRIPTEN__
-#include <GLES3/gl3.h>
+#include <GLES2/gl2.h>
 #else
 using GLuint = unsigned int;
 #endif
@@ -22,15 +23,11 @@ struct VideoConfig {
 };
 
 /**
- * Hardware video decoder wrapper for Samsung Tizen OS 10 WASM Player.
+ * Hardware video decoder wrapper for Samsung Tizen WASM Player (`emscripten-1.39.4.7`).
  *
  * Uses `samsung::wasm::ElementaryMediaStreamSource` configured with:
- *   - `LatencyMode::kUltraLow` (bypasses VOD buffering for game streaming)
- *   - `RenderingMode::kVideoTexture` (decodes directly into a WebGL2/GLES3 GPU texture)
- *
- * Every submitted elementary packet records `(pts_us -> rtp_frame_number)` in
- * `FrameWarp::note_frame_pts`, so when `fill_next_frame()` populates the GL texture
- * we immediately recover the exact frame number for Frame Warp tag lookup.
+ *   - `LatencyMode::kUltraLow`
+ *   - `RenderingMode::kVideoTexture` (populates `GL_TEXTURE_EXTERNAL_OES`)
  */
 class TizenVideoDecoder {
 public:
@@ -41,9 +38,9 @@ public:
     bool register_gl_context();
     bool submit_access_unit(const uint8_t* data, size_t size, uint32_t frame_number, int64_t pts_us, bool keyframe);
 
-    // Populates `target_texture` with the latest hardware-decoded frame (zero-copy on Tizen).
-    // Returns true if a new frame was latched, writing its RTP frame number into `out_frame`.
+    // Requests/latches the latest decoded video frame into `target_texture` (GL_TEXTURE_EXTERNAL_OES).
     bool fill_next_frame(GLuint target_texture, uint32_t& out_frame);
+    void recycle_texture(GLuint target_texture);
 
     void shutdown();
 
@@ -51,7 +48,10 @@ private:
     std::shared_ptr<frame_warp::FrameWarp> warp_;
     VideoConfig config_;
     bool initialized_ = false;
-    uint32_t last_frame_number_ = 0;
+    std::atomic<uint32_t> latest_submitted_frame_{0};
+    std::atomic<uint32_t> latched_frame_{0};
+    std::atomic<bool> texture_ready_{false};
+    std::atomic<bool> fill_in_flight_{false};
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -1,9 +1,5 @@
 # Builds Nightjar's Samsung Tizen OS 10 WASM streaming & Frame Warp engine
 # Uses Samsung's official Emscripten 1.39.4.7 SDK (Tizen WASM Player + Tizen Sockets + OpenSSL/cURL ports).
-#
-# Usage:
-#   docker build -f tizen/Dockerfile -t nightjar-tizen-wasm .
-#   docker run --rm -v "${PWD}/tizen/app/wasm:/out" nightjar-tizen-wasm
 FROM ubuntu:22.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -14,6 +10,8 @@ RUN apt-get update && apt-get install -y \
     cmake \
     git \
     ninja-build \
+    nodejs \
+    npm \
     python2 \
     python3 \
     unzip \
@@ -28,19 +26,23 @@ RUN wget -nv -O emscripten-1.39.4.7-linux64.zip 'https://developer.samsung.com/s
     && cd /opt/emscripten-release-bundle/emsdk \
     && ./emsdk activate latest-fastcomp
 
+RUN git clone --depth 1 --recurse-submodules https://github.com/moonlight-stream/moonlight-common-c.git /opt/moonlight-common-c
+
 WORKDIR /src
 COPY tizen/wasm /src/wasm
 
-RUN mkdir -p /src/build /src/app/wasm && \
+RUN python3 /src/wasm/scripts/patch_moonlight_frame_warp.py /opt/moonlight-common-c && \
+    mkdir -p /src/build /src/app/wasm && \
     cmake \
       -DCMAKE_TOOLCHAIN_FILE=/opt/emscripten-release-bundle/emsdk/fastcomp/emscripten/cmake/Modules/Platform/Emscripten.cmake \
       -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DTIZEN_WASM_SDK=ON \
       -DENABLE_MOONLIGHT_TRANSPORT=ON \
+      -DMOONLIGHT_COMMON_C_DIR=/opt/moonlight-common-c \
       -S /src/wasm \
       -B /src/build && \
-    cmake --build /src/build
+    cmake --build /src/build -v
 
 FROM alpine:3.20
 COPY --from=builder /src/app/wasm /wasm

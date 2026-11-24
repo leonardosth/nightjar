@@ -356,6 +356,7 @@ void NightjarSession::on_display_refresh() {
         auto w = opts_.frame_warp_enabled ? warp_->warp(frame_number, t_us) : frame_warp::Warp{};
         renderer_.sync_hud_mask(*warp_);
         renderer_.draw(w, frame_number, warp_->input_seq());
+        decoder_->recycle_texture(renderer_.video_texture());
     } else if (opts_.frame_warp_enabled) {
         renderer_.maybe_redraw_between_frames(*warp_, t_us);
     }

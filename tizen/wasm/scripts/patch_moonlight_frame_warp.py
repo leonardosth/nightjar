@@ -9,16 +9,6 @@ import pathlib
 import sys
 
 
-def patch_file(path: pathlib.Path, marker: str, anchor: str, replacement: str) -> None:
-    text = path.read_text(encoding="utf-8")
-    if marker in text:
-        return
-    if anchor not in text:
-        raise RuntimeError(f"Anchor not found in {path}: {anchor!r}")
-    path.write_text(text.replace(anchor, replacement, 1), encoding="utf-8")
-    print(f"Patched {path}")
-
-
 def main() -> None:
     if len(sys.argv) != 2:
         print("Usage: patch_moonlight_frame_warp.py <moonlight-common-c-dir>", file=sys.stderr)
@@ -70,7 +60,7 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len);
         rtsp_path.write_text(rtsp_text, encoding="utf-8")
         print(f"Patched {rtsp_path}")
 
-    # 3. ControlStream.c — receive 0x5544..=0x5546 and send 0x5543 over SS_ENC_CONTROL_V2
+    # 3. ControlStream.c — receive 0x5544..=0x5546 (ctlHdr is PNVCTL_ENET_PACKET_HEADER_V1, must free(ctlHdr)!)
     ctrl_path = src / "ControlStream.c"
     ctrl_text = ctrl_path.read_text(encoding="utf-8")
     if "g_frameWarpCallback" not in ctrl_text:
@@ -85,9 +75,13 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len);
         if term_anchor not in ctrl_text:
             raise RuntimeError("IDX_TERMINATION anchor not found in ControlStream.c")
         fw_branch = """else if (ctlHdr->type == 0x5544 || ctlHdr->type == 0x5545 || ctlHdr->type == 0x5546) {
-                if (g_frameWarpCallback != NULL) {
-                    g_frameWarpCallback(ctlHdr->type, (const uint8_t*)(ctlHdr + 1), ctlHdr->payloadLength);
+                if (g_frameWarpCallback != NULL && packetLength >= (int)sizeof(*ctlHdr)) {
+                    g_frameWarpCallback(
+                        ctlHdr->type,
+                        ((const uint8_t*)ctlHdr) + sizeof(*ctlHdr),
+                        (size_t)(packetLength - (int)sizeof(*ctlHdr)));
                 }
+                free(ctlHdr);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {"""
         ctrl_text = ctrl_text.replace(term_anchor, fw_branch, 1)

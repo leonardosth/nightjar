@@ -5,13 +5,12 @@ FROM ubuntu:22.04 AS builder
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     cmake \
     git \
     ninja-build \
     nodejs \
-    npm \
     python2 \
     python3 \
     unzip \
@@ -42,7 +41,7 @@ RUN python3 /src/wasm/scripts/patch_moonlight_frame_warp.py /opt/moonlight-commo
       -DMOONLIGHT_COMMON_C_DIR=/opt/moonlight-common-c \
       -S /src/wasm \
       -B /src/build && \
-    cmake --build /src/build -v
+    cmake --build /src/build
 
 FROM alpine:3.20
 COPY --from=builder /src/app/wasm /wasm

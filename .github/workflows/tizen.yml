@@ -1,0 +1,49 @@
+name: Tizen TV (Frame Warp)
+
+on:
+  push:
+    branches: [tizen, main]
+    paths:
+      - 'tizen/**'
+      - '.github/workflows/tizen.yml'
+  pull_request:
+    paths:
+      - 'tizen/**'
+
+jobs:
+  test-frame-warp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run JS Frame Warp v1 protocol & predictor tests
+        run: node --test tizen/tests/frame-warp.test.mjs
+
+      - name: Build & run C++17 Frame Warp unit tests
+        run: |
+          cmake -S tizen/wasm -B tizen/wasm/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build tizen/wasm/build
+          ctest --test-dir tizen/wasm/build --output-on-failure
+
+  build-tizen-wasm:
+    runs-on: ubuntu-latest
+    needs: test-frame-warp
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile Samsung Tizen WASM binary
+        run: |
+          mkdir -p tizen/app/wasm
+          docker build -f tizen/Dockerfile -t nightjar-tizen-wasm .
+          docker run --rm -v "${{ github.workspace }}/tizen/app/wasm:/out" nightjar-tizen-wasm
+
+      - name: Upload compiled WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightjar-tizen-wasm
+          path: tizen/app/wasm/

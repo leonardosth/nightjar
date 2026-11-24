@@ -50,3 +50,13 @@ app/.externalNativeBuild/
 .cxx/
 # Python bytecode
 __pycache__/
+
+# Tizen TV build artifacts & signing temp files
+*.wgt
+tizen/dist/
+tizen/wasm/build/
+tizen/app/.manifest.tmp
+tizen/app/.delta.lst
+tizen/app/author-signature.xml
+tizen/app/signature*.xml
+

@@ -123,6 +123,7 @@ else()
     enable_testing()
     add_executable(frame_warp_cpp_test
         src/host_http_client.cpp
+        src/warp_gl_renderer.cpp
         tests/frame_warp_test.cpp
     )
     target_link_libraries(frame_warp_cpp_test PRIVATE nightjar_frame_warp)

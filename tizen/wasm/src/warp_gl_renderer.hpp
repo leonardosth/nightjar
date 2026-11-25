@@ -14,7 +14,7 @@
 #else
 using GLuint = unsigned int;
 using GLint = int;
-using EmscriptenWebGLContextHandle = int;
+using EMSCRIPTEN_WEBGL_CONTEXT_HANDLE = int;
 #endif
 
 namespace nightjar::tizen {
@@ -40,7 +40,7 @@ public:
     void destroy();
 
 private:
-    EmscriptenWebGLContextHandle webgl_ctx_ = 0;
+    EMSCRIPTEN_WEBGL_CONTEXT_HANDLE webgl_ctx_ = 0;
     GLuint program_ = 0;
     GLuint vbo_ = 0;
     GLuint video_tex_ = 0;

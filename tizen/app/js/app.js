@@ -4,7 +4,14 @@
 
 import { WarpRenderer } from './warp-renderer.js';
 import { InputManager } from './input-manager.js';
-import { detectWasmEngine, FrameWarpDemoSession, WasmStreamSession } from './wasm-bridge.js';
+import {
+  detectWasmEngine,
+  probeHostAsync,
+  pairHostAsync,
+  listAppsAsync,
+  FrameWarpDemoSession,
+  WasmStreamSession,
+} from './wasm-bridge.js';
 
 const STORAGE_HOSTS = 'nightjar.tizen.hosts.v1';
 const STORAGE_SETTINGS = 'nightjar.tizen.settings.v1';
@@ -56,6 +63,7 @@ class NightjarTizenApp {
     this.renderer = null;
     this.session = null;
     this.streamMenuOpen = false;
+    this.focusedEl = null;
 
     this._bindElements();
     this._syncSettingsToDom();
@@ -69,10 +77,12 @@ class NightjarTizenApp {
     this.elLauncher = document.getElementById('launcher-view');
     this.elStream = document.getElementById('stream-view');
     this.elCanvas = document.getElementById('stream-canvas');
+    this.elDemoCanvas = document.getElementById('demo-canvas');
     this.elHostsGrid = document.getElementById('hosts-grid');
     this.elWasmPill = document.getElementById('wasm-status-pill');
     this.elPadPill = document.getElementById('gamepad-status-pill');
     this.elAddModal = document.getElementById('add-host-modal');
+    this.elDialogModal = document.getElementById('tv-dialog-modal');
     this.elStreamMenu = document.getElementById('stream-menu');
     this.elOverlay = document.getElementById('stream-overlay');
 
@@ -192,54 +202,87 @@ class NightjarTizenApp {
 
   _visibleFocusables() {
     let root = this.elLauncher;
-    if (!this.elAddModal.classList.contains('hidden')) root = this.elAddModal;
+    if (this.elDialogModal && !this.elDialogModal.classList.contains('hidden')) root = this.elDialogModal;
+    else if (!this.elAddModal.classList.contains('hidden')) root = this.elAddModal;
     else if (!this.elStreamMenu.classList.contains('hidden')) root = this.elStreamMenu;
     return Array.from(root.querySelectorAll('.focusable')).filter(
       (el) => el.offsetParent !== null
     );
   }
 
+  _setFocus(el) {
+    if (!el) return;
+    document.querySelectorAll('.focusable.focused').forEach((prev) => {
+      if (prev !== el) prev.classList.remove('focused');
+    });
+    this.focusedEl = el;
+    el.classList.add('focused');
+    try {
+      el.focus({ preventScroll: true });
+      if (el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+    } catch {
+      el.focus();
+    }
+  }
+
   _focusFirst() {
     const items = this._visibleFocusables();
-    if (items.length > 0) items[0].focus();
+    if (items.length > 0) this._setFocus(items[0]);
   }
 
   _handleNavigation(dir) {
     const items = this._visibleFocusables();
     if (items.length === 0) return;
-    const current = document.activeElement;
+    let current = document.activeElement;
+    if (!items.includes(current) && this.focusedEl && items.includes(this.focusedEl)) {
+      current = this.focusedEl;
+    }
     const idx = items.indexOf(current);
 
     if (dir === 'select') {
-      if (current && items.includes(current)) {
-        if (current.tagName === 'LABEL') {
-          const inner = current.querySelector('input, select');
-          if (inner && inner.type === 'checkbox') {
-            inner.checked = !inner.checked;
-            inner.dispatchEvent(new Event('change'));
-          } else if (inner && inner.tagName === 'SELECT') {
-            inner.selectedIndex = (inner.selectedIndex + 1) % inner.options.length;
-            inner.dispatchEvent(new Event('change'));
-          }
-        } else {
-          current.click();
+      const target = idx >= 0 ? items[idx] : items[0];
+      this._setFocus(target);
+      if (target.tagName === 'LABEL') {
+        const inner = target.querySelector('input, select');
+        if (inner && inner.type === 'checkbox') {
+          inner.checked = !inner.checked;
+          inner.dispatchEvent(new Event('change'));
+        } else if (inner && inner.tagName === 'SELECT') {
+          inner.selectedIndex = (inner.selectedIndex + 1) % inner.options.length;
+          inner.dispatchEvent(new Event('change'));
         }
+      } else {
+        target.click();
       }
       return;
     }
 
     const delta = dir === 'right' || dir === 'down' ? 1 : -1;
     const next = idx < 0 ? 0 : (idx + delta + items.length) % items.length;
-    items[next].focus();
+    this._setFocus(items[next]);
   }
 
   _handleBack() {
+    if (this.elDialogModal && !this.elDialogModal.classList.contains('hidden')) {
+      const cancelBtn = document.getElementById('btn-dialog-cancel');
+      if (cancelBtn && !cancelBtn.classList.contains('hidden')) cancelBtn.click();
+      else document.getElementById('btn-dialog-ok').click();
+      return;
+    }
     if (!this.elAddModal.classList.contains('hidden')) {
       this.closeAddHostModal();
       return;
     }
     if (this.activeTab !== 'hosts') {
       this.switchTab('hosts');
+      return;
+    }
+    try {
+      if (window.tizen && window.tizen.application) {
+        window.tizen.application.getCurrentApplication().exit();
+      }
+    } catch {
+      // ignore outside Tizen
     }
   }
 
@@ -302,52 +345,92 @@ class NightjarTizenApp {
     this.closeAddHostModal();
   }
 
-  connectHost(host) {
-    if (this.wasm.available && this.wasm.runtime && this.wasm.runtime.probeHost) {
-      const probe = JSON.parse(this.wasm.runtime.probeHost(host.address));
-      if (probe.error) {
-        alert(`Could not reach ${host.address}: ${probe.error}`);
-        return;
-      }
-      host.frameWarpVersion = probe.frameWarpVersion || 0;
-      host.paired = Boolean(probe.paired);
-      if (probe.hostname) host.name = probe.hostname;
-      this._saveHosts();
-      this._renderHosts();
+  showTvDialog(title, message, { confirm = false, okText = 'OK' } = {}) {
+    return new Promise((resolve) => {
+      document.getElementById('tv-dialog-title').textContent = title;
+      document.getElementById('tv-dialog-body').textContent = message;
+      const okBtn = document.getElementById('btn-dialog-ok');
+      const cancelBtn = document.getElementById('btn-dialog-cancel');
+      okBtn.textContent = okText;
+      cancelBtn.classList.toggle('hidden', !confirm);
+      this.elDialogModal.classList.remove('hidden');
 
-      if (!host.paired) {
-        const pin = String(Math.floor(1000 + Math.random() * 9000));
-        alert(`Enter PIN ${pin} in Rubylight / Sunshine on ${host.name}, then press OK.`);
-        const pairRes = JSON.parse(this.wasm.runtime.pairHost(host.address, pin));
-        if (!pairRes.ok) {
-          alert(`Pairing failed: ${pairRes.error}`);
+      const cleanup = (result) => {
+        okBtn.onclick = null;
+        cancelBtn.onclick = null;
+        this.elDialogModal.classList.add('hidden');
+        this._focusFirst();
+        resolve(result);
+      };
+      okBtn.onclick = () => cleanup(true);
+      cancelBtn.onclick = () => cleanup(false);
+      this._setFocus(okBtn);
+    });
+  }
+
+  async connectHost(host) {
+    // Built-in example card launches the interactive Frame Warp Live Test directly
+    if (host.id === 'demo-rubylight') {
+      this.startDemoStream();
+      return;
+    }
+
+    if (this.wasm.available && this.wasm.runtime && typeof this.wasm.runtime.startAsyncJob === 'function') {
+      try {
+        const probe = await probeHostAsync(this.wasm.runtime, host.address);
+        if (probe.error) {
+          await this.showTvDialog('Connection Failed', `Could not reach ${host.address}: ${probe.error}`);
           return;
         }
-        host.paired = true;
+        host.frameWarpVersion = probe.frameWarpVersion || 0;
+        host.paired = Boolean(probe.paired);
+        if (probe.hostname) host.name = probe.hostname;
         this._saveHosts();
         this._renderHosts();
-      }
 
-      const appRes = JSON.parse(this.wasm.runtime.listApps(host.address));
-      const appId = appRes.apps && appRes.apps.length > 0 ? appRes.apps[0].id : 0;
+        if (!host.paired) {
+          const pin = String(Math.floor(1000 + Math.random() * 9000));
+          const proceed = await this.showTvDialog(
+            `Pair with ${host.name}`,
+            `Enter PIN ${pin} in Rubylight / Sunshine on your PC, then select Pair.`,
+            { confirm: true, okText: 'Pair' }
+          );
+          if (!proceed) return;
 
-      try {
-        this._enterStreamView();
+          const pairRes = await pairHostAsync(this.wasm.runtime, host.address, pin);
+          if (!pairRes.ok) {
+            await this.showTvDialog('Pairing Failed', pairRes.error || 'Host rejected pairing');
+            return;
+          }
+          host.paired = true;
+          this._saveHosts();
+          this._renderHosts();
+        }
+
+        const appRes = await listAppsAsync(this.wasm.runtime, host.address);
+        const appId = appRes.apps && appRes.apps.length > 0 ? appRes.apps[0].id : 0;
+
+        this._enterStreamView(false);
         this.session = new WasmStreamSession(this.wasm.runtime, host, appId, this.settings);
-        this.session.start((stats) => this._updateOverlay(stats));
+        await this.session.start((stats) => this._updateOverlay(stats));
       } catch (err) {
         this.stopStream();
-        alert(`Stream failed: ${err.message}`);
+        await this.showTvDialog('Stream Error', err.message || String(err));
       }
     } else {
-      // Launch interactive Frame Warp Lab when native WASM binary is not yet bundled
+      await this.showTvDialog(
+        'Updating Native Stream Engine',
+        'Opening interactive Frame Warp Live Test while WASM pthread sockets module updates.'
+      );
       this.startDemoStream();
     }
   }
 
-  _enterStreamView() {
+  _enterStreamView(isDemo = false) {
     this.elLauncher.classList.remove('active');
     this.elStream.classList.add('active');
+    this.elCanvas.style.display = isDemo ? 'none' : 'block';
+    if (this.elDemoCanvas) this.elDemoCanvas.style.display = isDemo ? 'block' : 'none';
     this.elOverlay.classList.toggle('hidden', !this.settings.overlay);
     this.streamMenuOpen = false;
     this.elStreamMenu.classList.add('hidden');
@@ -356,9 +439,9 @@ class NightjarTizenApp {
   }
 
   startDemoStream() {
-    this._enterStreamView();
+    this._enterStreamView(true);
     if (!this.renderer) {
-      this.renderer = new WarpRenderer(this.elCanvas);
+      this.renderer = new WarpRenderer(this.elDemoCanvas || this.elCanvas);
     }
     this.session = new FrameWarpDemoSession(this.renderer, this.settings);
     this.session.start((stats) => this._updateOverlay(stats));

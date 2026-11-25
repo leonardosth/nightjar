@@ -207,10 +207,23 @@
       </div>
     </div>
 
+    <!-- TV Notice / Pairing PIN Dialog Modal -->
+    <div id="tv-dialog-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h3 id="tv-dialog-title">Notice</h3>
+        <p id="tv-dialog-body"></p>
+        <div class="modal-actions">
+          <button id="btn-dialog-cancel" class="btn btn-secondary focusable hidden">Cancel</button>
+          <button id="btn-dialog-ok" class="btn btn-primary focusable">OK</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Stream View -->
     <div id="stream-view" class="view">
       <video id="tizen-video-sink" style="display:none" playsinline muted></video>
       <canvas id="stream-canvas" width="1920" height="1080"></canvas>
+      <canvas id="demo-canvas" width="1920" height="1080" style="display:none"></canvas>
 
       <!-- Live Frame Warp & Performance Overlay -->
       <aside id="stream-overlay" class="stream-overlay">

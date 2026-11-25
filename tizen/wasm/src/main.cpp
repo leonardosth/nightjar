@@ -1,9 +1,13 @@
 #include "host_http_client.hpp"
 #include "nightjar_session.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <sstream>
+#include <thread>
+#include <unordered_map>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/bind.h>
@@ -14,6 +18,15 @@ namespace {
 nightjar::tizen::HostHttpClient g_http;
 std::unique_ptr<nightjar::tizen::NightjarSession> g_session;
 std::string g_last_error;
+
+struct AsyncJobResult {
+    bool done = false;
+    std::string payload_json;
+};
+
+std::mutex g_jobs_mutex;
+std::unordered_map<int, AsyncJobResult> g_jobs;
+std::atomic<int> g_next_job_id{1};
 
 std::string json_escape(const std::string& s) {
     std::string out;
@@ -45,7 +58,7 @@ std::string init_identity(const std::string& unique_id, const std::string& cert_
     return os.str();
 }
 
-std::string probe_host(const std::string& address) {
+std::string probe_host_impl(const std::string& address) {
     auto info = g_http.fetch_serverinfo(address);
     std::ostringstream os;
     os << "{\"hostname\":\"" << json_escape(info.hostname)
@@ -56,7 +69,7 @@ std::string probe_host(const std::string& address) {
     return os.str();
 }
 
-std::string pair_host(const std::string& address, const std::string& pin) {
+std::string pair_host_impl(const std::string& address, const std::string& pin) {
     std::string err;
     bool ok = g_http.pair_with_pin(address, pin, err);
     std::ostringstream os;
@@ -65,7 +78,7 @@ std::string pair_host(const std::string& address, const std::string& pin) {
     return os.str();
 }
 
-std::string list_apps(const std::string& address) {
+std::string list_apps_impl(const std::string& address) {
     std::string err;
     auto apps = g_http.fetch_applist(address, err);
     std::ostringstream os;
@@ -80,7 +93,64 @@ std::string list_apps(const std::string& address) {
     return os.str();
 }
 
-bool start_stream(
+// Spawns network/socket operations on a pthread Web Worker where Samsung's Tizen Sockets Extension lives
+int start_async_job(const std::string& op, const std::string& arg1, const std::string& arg2) {
+    int id = g_next_job_id.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(g_jobs_mutex);
+        g_jobs[id] = AsyncJobResult{false, "{}"};
+    }
+
+    std::thread([id, op, arg1, arg2]() {
+        std::string payload = "{}";
+        if (op == "probe") {
+            payload = probe_host_impl(arg1);
+        } else if (op == "pair") {
+            payload = pair_host_impl(arg1, arg2);
+        } else if (op == "applist") {
+            payload = list_apps_impl(arg1);
+        } else if (op == "connect_stream") {
+            std::string err;
+            bool ok = false;
+            if (g_session) {
+                ok = g_session->connect_on_worker_thread(err);
+            } else {
+                err = "Stream media session was not prepared";
+            }
+            std::ostringstream os;
+            os << "{\"ok\":" << (ok ? "true" : "false")
+               << ",\"error\":\"" << json_escape(err) << "\"}";
+            payload = os.str();
+        } else {
+            payload = "{\"error\":\"Unknown async op\"}";
+        }
+
+        std::lock_guard<std::mutex> lk(g_jobs_mutex);
+        auto it = g_jobs.find(id);
+        if (it != g_jobs.end()) {
+            it->second.done = true;
+            it->second.payload_json = std::move(payload);
+        }
+    }).detach();
+
+    return id;
+}
+
+std::string poll_async_job(int id) {
+    std::lock_guard<std::mutex> lk(g_jobs_mutex);
+    auto it = g_jobs.find(id);
+    if (it == g_jobs.end()) {
+        return "{\"done\":true,\"payload\":{\"error\":\"Invalid job id\"}}";
+    }
+    if (!it->second.done) {
+        return "{\"done\":false}";
+    }
+    std::string out = "{\"done\":true,\"payload\":" + it->second.payload_json + "}";
+    g_jobs.erase(it);
+    return out;
+}
+
+bool prepare_stream_media(
     const std::string& address,
     int app_id,
     bool resume,
@@ -107,12 +177,17 @@ bool start_stream(
     opts.frame_warp_mask_width = fw_mask_width;
 
     g_last_error.clear();
-    if (!g_session->start(opts, g_last_error)) {
+    if (!g_session->init_media_on_main_thread(opts, g_last_error)) {
         g_session.reset();
         return false;
     }
-    emscripten_request_animation_frame_loop(on_raf, nullptr);
     return true;
+}
+
+void start_stream_loop() {
+    if (g_session) {
+        emscripten_request_animation_frame_loop(on_raf, nullptr);
+    }
 }
 
 std::string last_error() { return g_last_error; }
@@ -162,10 +237,13 @@ std::string get_frame_warp_status() {
 
 EMSCRIPTEN_BINDINGS(nightjar_tizen) {
     emscripten::function("initIdentity", &init_identity);
-    emscripten::function("probeHost", &probe_host);
-    emscripten::function("pairHost", &pair_host);
-    emscripten::function("listApps", &list_apps);
-    emscripten::function("startStream", &start_stream);
+    emscripten::function("startAsyncJob", &start_async_job);
+    emscripten::function("pollAsyncJob", &poll_async_job);
+    emscripten::function("prepareStreamMedia", &prepare_stream_media);
+    emscripten::function("startStreamLoop", &start_stream_loop);
+    emscripten::function("probeHost", &probe_host_impl);
+    emscripten::function("pairHost", &pair_host_impl);
+    emscripten::function("listApps", &list_apps_impl);
     emscripten::function("lastError", &last_error);
     emscripten::function("stopStream", &stop_stream);
     emscripten::function("setFrameWarpEnabled", &set_frame_warp_enabled);

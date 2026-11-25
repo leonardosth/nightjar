@@ -70,6 +70,28 @@ WarpGlRenderer::~WarpGlRenderer() { destroy(); }
 
 bool WarpGlRenderer::init(int width, int height) {
 #ifdef __EMSCRIPTEN__
+    if (!webgl_ctx_) {
+        EmscriptenWebGLContextAttributes attrs;
+        emscripten_webgl_init_context_attributes(&attrs);
+        attrs.alpha = EM_FALSE;
+        attrs.depth = EM_FALSE;
+        attrs.stencil = EM_FALSE;
+        attrs.antialias = EM_FALSE;
+        attrs.preserveDrawingBuffer = EM_FALSE;
+        attrs.majorVersion = 1;
+        attrs.minorVersion = 0;
+        attrs.enableExtensionsByDefault = EM_TRUE;
+        webgl_ctx_ = emscripten_webgl_create_context("#stream-canvas", &attrs);
+        if (webgl_ctx_ <= 0) {
+            webgl_ctx_ = 0;
+            return false;
+        }
+    }
+    if (emscripten_webgl_make_context_current(webgl_ctx_) != EMSCRIPTEN_RESULT_SUCCESS) {
+        return false;
+    }
+    emscripten_webgl_enable_extension(webgl_ctx_, "OES_EGL_image_external");
+
     GLuint vs = compile_shader(GL_VERTEX_SHADER, kVertSrc);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, kFragSrc);
     if (!vs || !fs) return false;
@@ -222,10 +244,17 @@ bool WarpGlRenderer::maybe_redraw_between_frames(frame_warp::FrameWarp& warp, ui
 
 void WarpGlRenderer::destroy() {
 #ifdef __EMSCRIPTEN__
+    if (webgl_ctx_ > 0) {
+        emscripten_webgl_make_context_current(webgl_ctx_);
+    }
     if (video_tex_) { glDeleteTextures(1, &video_tex_); video_tex_ = 0; }
     if (mask_tex_) { glDeleteTextures(1, &mask_tex_); mask_tex_ = 0; }
     if (vbo_) { glDeleteBuffers(1, &vbo_); vbo_ = 0; }
     if (program_) { glDeleteProgram(program_); program_ = 0; }
+    if (webgl_ctx_ > 0) {
+        emscripten_webgl_destroy_context(webgl_ctx_);
+        webgl_ctx_ = 0;
+    }
 #endif
 }
 

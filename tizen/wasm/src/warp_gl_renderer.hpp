@@ -10,9 +10,11 @@
 #ifdef __EMSCRIPTEN__
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <emscripten/html5.h>
 #else
 using GLuint = unsigned int;
 using GLint = int;
+using EmscriptenWebGLContextHandle = int;
 #endif
 
 namespace nightjar::tizen {
@@ -38,6 +40,7 @@ public:
     void destroy();
 
 private:
+    EmscriptenWebGLContextHandle webgl_ctx_ = 0;
     GLuint program_ = 0;
     GLuint vbo_ = 0;
     GLuint video_tex_ = 0;

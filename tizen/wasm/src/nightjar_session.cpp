@@ -92,13 +92,40 @@ uint64_t NightjarSession::now_us() const {
     return now >= epoch_us_ ? (now - epoch_us_) : 0;
 }
 
-bool NightjarSession::start(const StreamOptions& opts, std::string& out_error) {
+bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::string& out_error) {
     stop();
     opts_ = opts;
     epoch_us_ = steady_now_us();
     frame_warp_negotiated_.store(false, std::memory_order_release);
 
-    // 1. Probe /serverinfo for <FrameWarpVersion> and host versions
+    warp_ = std::make_shared<frame_warp::FrameWarp>(
+        std::optional<uint8_t>(0),
+        opts.frame_warp_mask_width
+    );
+
+    if (!renderer_.init(static_cast<int>(opts.width), static_cast<int>(opts.height))) {
+        out_error = "WebGL/OES WarpGlRenderer initialization failed";
+        return false;
+    }
+
+    decoder_ = std::make_unique<TizenVideoDecoder>(warp_);
+    VideoConfig vcfg;
+    vcfg.codec = opts.codec;
+    vcfg.width = opts.width;
+    vcfg.height = opts.height;
+    vcfg.fps = opts.fps;
+    if (!decoder_->initialize(vcfg)) {
+        out_error = "TizenVideoDecoder (kVideoTexture) initialization failed";
+        return false;
+    }
+    decoder_->register_gl_context();
+    return true;
+}
+
+bool NightjarSession::connect_on_worker_thread(std::string& out_error) {
+    const StreamOptions& opts = opts_;
+
+    // 1. Probe /serverinfo for <FrameWarpVersion> and host versions (runs on pthread worker for Tizen Sockets)
     ServerInfo sinfo = http_.fetch_serverinfo(opts.host_address);
     if (!sinfo.raw_error.empty()) {
         out_error = "Failed to reach host /serverinfo: " + sinfo.raw_error;
@@ -123,29 +150,6 @@ bool NightjarSession::start(const StreamOptions& opts, std::string& out_error) {
         out_error = "Launch/resume failed: " + launch.error;
         return false;
     }
-
-    // 3. Prepare Frame Warp predictor, WebGL2/GLES3 renderer, and Tizen kVideoTexture decoder
-    warp_ = std::make_shared<frame_warp::FrameWarp>(
-        std::optional<uint8_t>(0),
-        opts.frame_warp_mask_width
-    );
-
-    if (!renderer_.init(static_cast<int>(opts.width), static_cast<int>(opts.height))) {
-        out_error = "WebGL2/GLES3 WarpGlRenderer initialization failed";
-        return false;
-    }
-
-    decoder_ = std::make_unique<TizenVideoDecoder>(warp_);
-    VideoConfig vcfg;
-    vcfg.codec = opts.codec;
-    vcfg.width = opts.width;
-    vcfg.height = opts.height;
-    vcfg.fps = opts.fps;
-    if (!decoder_->initialize(vcfg)) {
-        out_error = "TizenVideoDecoder (kVideoTexture) initialization failed";
-        return false;
-    }
-    decoder_->register_gl_context();
 
     g_active_session = this;
 
@@ -208,6 +212,13 @@ bool NightjarSession::start(const StreamOptions& opts, std::string& out_error) {
 
     running_.store(true, std::memory_order_release);
     return true;
+}
+
+bool NightjarSession::start(const StreamOptions& opts, std::string& out_error) {
+    if (!init_media_on_main_thread(opts, out_error)) {
+        return false;
+    }
+    return connect_on_worker_thread(out_error);
 }
 
 void NightjarSession::stop() {

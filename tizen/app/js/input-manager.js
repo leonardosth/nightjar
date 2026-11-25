@@ -21,6 +21,13 @@ const TIZEN_KEYS = [
 ];
 
 export const TIZEN_KEY_BACK = 10009;
+export const KEY_LEFT = 37;
+export const KEY_UP = 38;
+export const KEY_RIGHT = 39;
+export const KEY_DOWN = 40;
+export const KEY_ENTER = 13;
+export const TIZEN_KEY_YELLOW = 405;
+export const TIZEN_KEY_MENU = 10133;
 
 function floatToI16(v) {
   const clamped = Math.max(-1.0, Math.min(1.0, v));
@@ -38,6 +45,7 @@ export class InputManager {
     this.streaming = false;
     this.lastNavAt = 0;
     this.lastMenuChord = false;
+    this._lastPadCount = -1;
     this._raf = null;
 
     this._registerTizenKeys();
@@ -48,7 +56,13 @@ export class InputManager {
   _registerTizenKeys() {
     try {
       if (typeof window !== 'undefined' && window.tizen && window.tizen.tvinputdevice) {
-        window.tizen.tvinputdevice.registerKeyBatch(TIZEN_KEYS);
+        for (const k of TIZEN_KEYS) {
+          try {
+            window.tizen.tvinputdevice.registerKey(k);
+          } catch {
+            // Ignore unsupported optional key on specific TV model
+          }
+        }
       }
     } catch {
       // Running outside Tizen TV runtime (e.g., desktop browser preview)
@@ -57,8 +71,12 @@ export class InputManager {
 
   _bindDomEvents() {
     window.addEventListener('keydown', (ev) => {
-      if (ev.keyCode === TIZEN_KEY_BACK || ev.key === 'Escape' || ev.key === 'Backspace') {
-        if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA') && ev.key === 'Backspace') {
+      const code = ev.keyCode | 0;
+      const key = ev.key || '';
+      const tagName = ev.target && ev.target.tagName ? ev.target.tagName : '';
+
+      if (code === TIZEN_KEY_BACK || key === 'XF86Back' || key === 'Escape' || key === 'Backspace') {
+        if ((tagName === 'INPUT' || tagName === 'TEXTAREA') && key === 'Backspace') {
           return;
         }
         ev.preventDefault();
@@ -70,23 +88,38 @@ export class InputManager {
         return;
       }
 
+      const isUp = key === 'ArrowUp' || code === KEY_UP;
+      const isDown = key === 'ArrowDown' || code === KEY_DOWN;
+      const isLeft = key === 'ArrowLeft' || code === KEY_LEFT;
+      const isRight = key === 'ArrowRight' || code === KEY_RIGHT;
+      const isEnter = key === 'Enter' || code === KEY_ENTER;
+      const isMenu =
+        key === 'm' ||
+        key === 'M' ||
+        key === 'Menu' ||
+        key === 'Info' ||
+        key === 'ColorF2Yellow' ||
+        code === TIZEN_KEY_MENU ||
+        code === TIZEN_KEY_YELLOW;
+
       if (this.streaming) {
-        // Allow keyboard arrow keys in Frame Warp Demo mode as simulated mouse camera turn
-        const step = 14;
-        if (ev.key === 'ArrowLeft') this.onMouseMove(-step, 0);
-        else if (ev.key === 'ArrowRight') this.onMouseMove(step, 0);
-        else if (ev.key === 'ArrowUp') this.onMouseMove(0, -step);
-        else if (ev.key === 'ArrowDown') this.onMouseMove(0, step);
-        else if (ev.key === 'm' || ev.key === 'M') this.onStreamMenu();
+        // Allow TV remote / keyboard arrow keys in Frame Warp Demo mode as simulated camera turn
+        const step = 18;
+        if (isLeft) { ev.preventDefault(); this.onMouseMove(-step, 0); }
+        else if (isRight) { ev.preventDefault(); this.onMouseMove(step, 0); }
+        else if (isUp) { ev.preventDefault(); this.onMouseMove(0, -step); }
+        else if (isDown) { ev.preventDefault(); this.onMouseMove(0, step); }
+        else if (isMenu || isEnter) { ev.preventDefault(); this.onStreamMenu(); }
         return;
       }
 
-      if (ev.key === 'ArrowUp') { ev.preventDefault(); this.onNavigate('up'); }
-      else if (ev.key === 'ArrowDown') { ev.preventDefault(); this.onNavigate('down'); }
-      else if (ev.key === 'ArrowLeft') { ev.preventDefault(); this.onNavigate('left'); }
-      else if (ev.key === 'ArrowRight') { ev.preventDefault(); this.onNavigate('right'); }
-      else if (ev.key === 'Enter') {
-        if (ev.target && ev.target.tagName !== 'SELECT') {
+      if (isUp) { ev.preventDefault(); this.onNavigate('up'); }
+      else if (isDown) { ev.preventDefault(); this.onNavigate('down'); }
+      else if (isLeft) { ev.preventDefault(); this.onNavigate('left'); }
+      else if (isRight) { ev.preventDefault(); this.onNavigate('right'); }
+      else if (isEnter) {
+        if (tagName !== 'SELECT' && tagName !== 'INPUT') {
+          ev.preventDefault();
           this.onNavigate('select');
         }
       }
@@ -108,16 +141,30 @@ export class InputManager {
   }
 
   _emitGamepadCount() {
-    const pads = navigator.getGamepads ? Array.from(navigator.getGamepads()).filter(Boolean) : [];
+    const pads = navigator.getGamepads
+      ? Array.from(navigator.getGamepads()).filter((p) => p && p.connected !== false)
+      : [];
+    this._lastPadCount = pads.length;
     this.onGamepadStatus(pads);
   }
 
   _startGamepadLoop() {
     const poll = (now) => {
-      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
-      for (let i = 0; i < pads.length; i++) {
-        const pad = pads[i];
-        if (!pad) continue;
+      const rawPads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const connectedPads = [];
+      for (let i = 0; i < rawPads.length; i++) {
+        if (rawPads[i] && rawPads[i].connected !== false) {
+          connectedPads.push(rawPads[i]);
+        }
+      }
+      if (connectedPads.length !== this._lastPadCount) {
+        this._lastPadCount = connectedPads.length;
+        this.onGamepadStatus(connectedPads);
+      }
+
+      for (let i = 0; i < rawPads.length; i++) {
+        const pad = rawPads[i];
+        if (!pad || pad.connected === false) continue;
 
         if (this.streaming) {
           // Standard W3C mapping: axes[2] = right stick X, axes[3] = right stick Y (inverted vs Moonlight y-up)
@@ -153,10 +200,14 @@ export class InputManager {
         } else if (now - this.lastNavAt > 170) {
           const ax = pad.axes[0] || 0;
           const ay = pad.axes[1] || 0;
-          if (pad.buttons[12]?.pressed || ay < -0.6) { this.lastNavAt = now; this.onNavigate('up'); }
-          else if (pad.buttons[13]?.pressed || ay > 0.6) { this.lastNavAt = now; this.onNavigate('down'); }
-          else if (pad.buttons[14]?.pressed || ax < -0.6) { this.lastNavAt = now; this.onNavigate('left'); }
-          else if (pad.buttons[15]?.pressed || ax > 0.6) { this.lastNavAt = now; this.onNavigate('right'); }
+          // Non-standard Linux hid-microsoft / xpad fallback where D-Pad maps to axes[6]/axes[7]
+          const hatX = pad.mapping !== 'standard' && pad.axes.length >= 8 ? (pad.axes[6] || 0) : 0;
+          const hatY = pad.mapping !== 'standard' && pad.axes.length >= 8 ? (pad.axes[7] || 0) : 0;
+
+          if (pad.buttons[12]?.pressed || ay < -0.55 || hatY < -0.5) { this.lastNavAt = now; this.onNavigate('up'); }
+          else if (pad.buttons[13]?.pressed || ay > 0.55 || hatY > 0.5) { this.lastNavAt = now; this.onNavigate('down'); }
+          else if (pad.buttons[14]?.pressed || ax < -0.55 || hatX < -0.5) { this.lastNavAt = now; this.onNavigate('left'); }
+          else if (pad.buttons[15]?.pressed || ax > 0.55 || hatX > 0.5) { this.lastNavAt = now; this.onNavigate('right'); }
           else if (pad.buttons[0]?.pressed) { this.lastNavAt = now; this.onNavigate('select'); }
           else if (pad.buttons[1]?.pressed) { this.lastNavAt = now; this.onBack(); }
         }

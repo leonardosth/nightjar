@@ -41,9 +41,54 @@ export async function detectWasmEngine() {
     if (typeof window.NightjarWasmModule !== 'function') {
       return { available: false, runtime: null };
     }
-    const mod = await window.NightjarWasmModule({
-      canvas: document.getElementById('stream-canvas'),
+
+    // Samsung Emscripten 1.39.4.7 attaches a persistent Module["then"] that returns Module
+    // without deleting Module["then"] first. Directly `await`-ing NightjarWasmModule(...)
+    // triggers an infinite ECMAScript Thenable microtask loop that freezes Tizen's main thread.
+    const mod = await new Promise((resolve, reject) => {
+      let settled = false;
+      let instance = null;
+      const finish = (m) => {
+        if (settled) return;
+        settled = true;
+        if (m && typeof m === 'object' && 'then' in m) {
+          delete m.then;
+        }
+        resolve(m);
+      };
+      try {
+        instance = window.NightjarWasmModule({
+          canvas: document.getElementById('stream-canvas'),
+          locateFile: (path) => `wasm/${path}`,
+          onRuntimeInitialized() {
+            // If called synchronously inside NightjarWasmModule(), `instance` is assigned right after
+            Promise.resolve().then(() => finish(instance));
+          },
+          onAbort(reason) {
+            if (!settled) {
+              settled = true;
+              reject(new Error(`WASM aborted: ${reason}`));
+            }
+          },
+        });
+        if (instance && typeof instance === 'object') {
+          if ('then' in instance) {
+            delete instance.then;
+          }
+          if (instance.calledRun) {
+            finish(instance);
+          }
+        }
+      } catch (err) {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      }
     });
+
+    // Yield a macrotask before RSA/X.509 identity setup so initial TV UI paint & input stay responsive
+    await new Promise((r) => setTimeout(r, 0));
 
     // Initialize or restore persistent RSA-2048/X.509 client identity
     let stored = { uniqueId: '', certPem: '', keyPem: '' };
@@ -61,9 +106,37 @@ export async function detectWasmEngine() {
     }
 
     return { available: true, runtime: mod };
-  } catch {
+  } catch (err) {
+    console.warn('[Nightjar] detectWasmEngine fallback:', err);
     return { available: false, runtime: null };
   }
+}
+
+export async function runWasmJobAsync(runtime, op, arg1 = '', arg2 = '') {
+  if (!runtime || typeof runtime.startAsyncJob !== 'function' || typeof runtime.pollAsyncJob !== 'function') {
+    throw new Error('WASM runtime requires pthread async job support (rebuild tizen/wasm)');
+  }
+  const jobId = runtime.startAsyncJob(op, String(arg1), String(arg2));
+  while (true) {
+    const raw = runtime.pollAsyncJob(jobId);
+    const parsed = JSON.parse(raw);
+    if (parsed.done) {
+      return parsed.payload;
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+export async function probeHostAsync(runtime, address) {
+  return runWasmJobAsync(runtime, 'probe', address, '');
+}
+
+export async function pairHostAsync(runtime, address, pin) {
+  return runWasmJobAsync(runtime, 'pair', address, pin);
+}
+
+export async function listAppsAsync(runtime, address) {
+  return runWasmJobAsync(runtime, 'applist', address, '');
 }
 
 export class WasmStreamSession {
@@ -72,27 +145,38 @@ export class WasmStreamSession {
     this.host = host;
     this.appId = appId;
     this.settings = settings;
-    this.enabled = Boolean(settings.fwEnabled);
+    this.enabled = settings.fwEnabled !== false;
     this._timer = null;
   }
 
-  start(onStats) {
+  async start(onStats) {
     const [w, h] = String(this.settings.resolution || '3840x2160').split('x').map(Number);
-    const ok = this.runtime.startStream(
-      this.host.address,
-      this.appId || 0,
-      false,
-      w || 3840,
-      h || 2160,
-      Number(this.settings.fps) || 120,
-      this.settings.codec || 'hevc',
-      Number(this.settings.bitrate) || 100,
-      this.enabled,
-      Boolean(this.settings.fwLens),
-      Number(this.settings.fwMaskWidth) || 1024
-    );
-    if (!ok) {
-      throw new Error(this.runtime.lastError ? this.runtime.lastError() : 'Failed to start WASM stream');
+    if (typeof this.runtime.prepareStreamMedia === 'function' && typeof this.runtime.startAsyncJob === 'function') {
+      const prepOk = this.runtime.prepareStreamMedia(
+        this.host.address,
+        this.appId || 0,
+        false,
+        w || 3840,
+        h || 2160,
+        Number(this.settings.fps) || 120,
+        this.settings.codec || 'hevc',
+        Number(this.settings.bitrate) || 100,
+        this.enabled,
+        this.settings.fwLens !== false,
+        Number(this.settings.fwMaskWidth) || 1024
+      );
+      if (!prepOk) {
+        throw new Error(this.runtime.lastError ? this.runtime.lastError() : 'Failed to initialize TV WebGL / video decoder');
+      }
+      const conn = await runWasmJobAsync(this.runtime, 'connect_stream', this.host.address, String(this.appId || 0));
+      if (!conn || !conn.ok) {
+        throw new Error((conn && conn.error) || 'Failed to connect stream');
+      }
+      if (typeof this.runtime.startStreamLoop === 'function') {
+        this.runtime.startStreamLoop();
+      }
+    } else {
+      throw new Error('WASM pthread streaming bridge needs updated WASM build');
     }
 
     this._timer = setInterval(() => {

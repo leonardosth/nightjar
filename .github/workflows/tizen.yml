@@ -21,8 +21,8 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Run JS Frame Warp v1 protocol & predictor tests
-        run: node --test tizen/tests/frame-warp.test.mjs
+      - name: Run JS Frame Warp v1, WASM runtime & TV input tests
+        run: node --test tizen/tests/frame-warp.test.mjs tizen/tests/tv-runtime-and-input.test.mjs
 
       - name: Build & run C++17 Frame Warp unit tests
         run: |

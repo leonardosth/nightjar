@@ -17,9 +17,9 @@ $AppDir = Join-Path $PSScriptRoot "app"
 $DistDir = Join-Path $PSScriptRoot "dist"
 
 if (-not $SkipTests) {
-    Write-Host "==> Running Frame Warp v1 unit tests..." -ForegroundColor Cyan
-    node --test (Join-Path $PSScriptRoot "tests\frame-warp.test.mjs")
-    if ($LASTEXITCODE -ne 0) { throw "Frame Warp tests failed." }
+    Write-Host "==> Running Nightjar Tizen unit tests..." -ForegroundColor Cyan
+    node --test (Join-Path $PSScriptRoot "tests\frame-warp.test.mjs") (Join-Path $PSScriptRoot "tests\tv-runtime-and-input.test.mjs")
+    if ($LASTEXITCODE -ne 0) { throw "Nightjar Tizen unit tests failed." }
 }
 
 # Ensure icon.png exists in tizen/app/

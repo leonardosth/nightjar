@@ -467,7 +467,7 @@ html, body {
 }
 
 /* Stream View */
-#stream-canvas {
+#stream-canvas, #demo-canvas {
   width: 100%;
   height: 100%;
   display: block;

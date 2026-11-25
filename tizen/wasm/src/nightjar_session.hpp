@@ -40,6 +40,8 @@ public:
     explicit NightjarSession(HostHttpClient& http);
     ~NightjarSession();
 
+    bool init_media_on_main_thread(const StreamOptions& opts, std::string& out_error);
+    bool connect_on_worker_thread(std::string& out_error);
     bool start(const StreamOptions& opts, std::string& out_error);
     void stop();
 

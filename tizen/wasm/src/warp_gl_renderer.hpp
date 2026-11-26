@@ -21,8 +21,8 @@ namespace nightjar::tizen {
 
 /**
  * GLES 2.0 + `GL_OES_EGL_image_external` Frame Warp renderer for Samsung Tizen WASM Player.
- * Uses `GL_TEXTURE_EXTERNAL_OES` (populated directly by `ElementaryMediaTrack::FillTextureWithNextFrame`)
- * and a `GL_LUMINANCE` 1-byte-per-cell HUD mask texture (`uHudMask`).
+ * Allocates a 3-texture ring (`GL_TEXTURE_EXTERNAL_OES`) so the currently displayed texture
+ * remains valid for 120 Hz inter-frame redraws until replaced by a newer decoded frame.
  */
 class WarpGlRenderer {
 public:
@@ -33,17 +33,19 @@ public:
     void resize(int width, int height);
     void set_picture_crop(uint32_t picture_w, uint32_t picture_h, uint32_t coded_w, uint32_t coded_h);
     void sync_hud_mask(frame_warp::FrameWarp& warp);
-    void draw(const frame_warp::Warp& w, uint32_t frame_number, uint32_t input_seq);
-    bool maybe_redraw_between_frames(frame_warp::FrameWarp& warp, uint64_t now_us);
+    void draw(GLuint video_tex, const frame_warp::Warp& w, uint32_t frame_number, uint32_t input_seq);
+    bool maybe_redraw_between_frames(GLuint video_tex, frame_warp::FrameWarp& warp, uint64_t now_us);
 
-    GLuint video_texture() const { return video_tex_; }
+    std::array<GLuint, 3> video_textures() const { return video_texs_; }
     void destroy();
 
 private:
+    void sync_viewport();
+
     EMSCRIPTEN_WEBGL_CONTEXT_HANDLE webgl_ctx_ = 0;
     GLuint program_ = 0;
     GLuint vbo_ = 0;
-    GLuint video_tex_ = 0;
+    std::array<GLuint, 3> video_texs_{0, 0, 0};
     GLuint mask_tex_ = 0;
     GLint a_pos_ = -1;
     GLint a_uv_ = -1;
@@ -52,6 +54,8 @@ private:
     GLint u_warp_ = -1;
     GLint u_lens_ = -1;
     GLint u_warp_rect_ = -1;
+    int viewport_w_ = 0;
+    int viewport_h_ = 0;
 
     std::optional<uint16_t> known_mask_gen_;
     bool has_mask_ = false;

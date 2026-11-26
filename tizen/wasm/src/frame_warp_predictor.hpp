@@ -51,6 +51,7 @@ public:
 
     void note(int64_t pts_us, uint32_t frame_number);
     std::optional<uint32_t> lookup(int64_t pts_us) const;
+    std::optional<uint32_t> lookup_nearest(int64_t pts_us, int64_t tolerance_us) const;
     void clear();
 
 private:
@@ -141,6 +142,7 @@ public:
 
     void note_frame_pts(int64_t pts_us, uint32_t frame_number);
     std::optional<uint32_t> lookup_frame_pts(int64_t pts_us);
+    std::optional<uint32_t> lookup_frame_pts_nearest(int64_t pts_us, int64_t tolerance_us);
 
 private:
     std::optional<uint8_t> controller_;

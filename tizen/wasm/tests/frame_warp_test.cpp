@@ -3,6 +3,7 @@
 #include "frame_warp_protocol.hpp"
 #include "host_http_client.hpp"
 #include "tizen_audio_decoder.hpp"
+#include "tizen_video_decoder.hpp"
 #include "worker_queue.hpp"
 
 #include <atomic>
@@ -138,6 +139,38 @@ int main() {
         audio.decode_and_play(dummy, sizeof(dummy));
         assert(std::fabs(audio.current_pts_sec() - (480.0 / 48000.0)) < 1e-6);
         audio.shutdown();
+    }
+
+    // 11. FrameRing nearest PTS lookup within half-frame tolerance
+    {
+        FrameRing ring;
+        ring.note(0, 100);
+        ring.note(8333, 101);
+        ring.note(16666, 102);
+        assert(ring.lookup_nearest(8330, 4000) == 101u);
+        assert(!ring.lookup_nearest(50000, 4000).has_value());
+    }
+
+    // 12. TextureRing keeps displayed texture un-recycled across 120 Hz inter-frame redraws
+    {
+        TextureRing tr;
+        tr.init({11u, 22u, 33u});
+        auto s0 = tr.acquire_for_fill();
+        assert(s0.has_value() && *s0 == 0u);
+        tr.mark_filled(*s0, 500u);
+
+        uint32_t f = 0;
+        std::optional<GLuint> recycle;
+        assert(tr.swap_to_display(f, recycle) && f == 500u && !recycle.has_value());
+        assert(tr.current_display_texture() == 11u);
+        assert(!tr.swap_to_display(f, recycle));
+        assert(tr.current_display_texture() == 11u);
+
+        auto s1 = tr.acquire_for_fill();
+        assert(s1.has_value() && *s1 == 1u);
+        tr.mark_filled(*s1, 501u);
+        assert(tr.swap_to_display(f, recycle) && f == 501u && recycle == 11u);
+        assert(tr.current_display_texture() == 22u);
     }
 
     std::cout << "All C++ Frame Warp & HostHttpClient tests passed!\n";

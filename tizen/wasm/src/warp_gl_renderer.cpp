@@ -68,6 +68,20 @@ GLuint compile_shader(GLenum type, const char* src) {
 WarpGlRenderer::WarpGlRenderer() = default;
 WarpGlRenderer::~WarpGlRenderer() { destroy(); }
 
+void WarpGlRenderer::sync_viewport() {
+#ifdef __EMSCRIPTEN__
+    if (webgl_ctx_ <= 0) return;
+    int db_w = 0;
+    int db_h = 0;
+    if (emscripten_webgl_get_drawing_buffer_size(webgl_ctx_, &db_w, &db_h) == EMSCRIPTEN_RESULT_SUCCESS &&
+        db_w > 0 && db_h > 0 && (db_w != viewport_w_ || db_h != viewport_h_)) {
+        viewport_w_ = db_w;
+        viewport_h_ = db_h;
+        glViewport(0, 0, db_w, db_h);
+    }
+#endif
+}
+
 bool WarpGlRenderer::init(int width, int height) {
 #ifdef __EMSCRIPTEN__
     if (!webgl_ctx_) {
@@ -125,13 +139,15 @@ bool WarpGlRenderer::init(int width, int height) {
     u_lens_ = glGetUniformLocation(program_, "uLens");
     u_warp_rect_ = glGetUniformLocation(program_, "uWarpRect");
 
-    glGenTextures(1, &video_tex_);
+    glGenTextures(3, video_texs_.data());
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, video_tex_);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    for (GLuint tex : video_texs_) {
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
 
     glGenTextures(1, &mask_tex_);
     glActiveTexture(GL_TEXTURE1);
@@ -143,7 +159,12 @@ bool WarpGlRenderer::init(int width, int height) {
     uint8_t zero = 0;
     glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 1, 1, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, &zero);
 
-    resize(width, height);
+    viewport_w_ = 0;
+    viewport_h_ = 0;
+    sync_viewport();
+    if (viewport_w_ == 0 || viewport_h_ == 0) {
+        resize(width, height);
+    }
     return true;
 #else
     (void)width;
@@ -154,6 +175,8 @@ bool WarpGlRenderer::init(int width, int height) {
 
 void WarpGlRenderer::resize(int width, int height) {
 #ifdef __EMSCRIPTEN__
+    viewport_w_ = width;
+    viewport_h_ = height;
     glViewport(0, 0, width, height);
 #else
     (void)width;
@@ -195,8 +218,10 @@ void WarpGlRenderer::sync_hud_mask(frame_warp::FrameWarp& warp) {
 #endif
 }
 
-void WarpGlRenderer::draw(const frame_warp::Warp& w, uint32_t frame_number, uint32_t input_seq) {
+void WarpGlRenderer::draw(GLuint video_tex, const frame_warp::Warp& w, uint32_t frame_number, uint32_t input_seq) {
 #ifdef __EMSCRIPTEN__
+    if (video_tex == 0) return;
+    sync_viewport();
     glUseProgram(program_);
     glBindBuffer(GL_ARRAY_BUFFER, vbo_);
     glEnableVertexAttribArray(static_cast<GLuint>(a_pos_));
@@ -205,7 +230,7 @@ void WarpGlRenderer::draw(const frame_warp::Warp& w, uint32_t frame_number, uint
     glVertexAttribPointer(static_cast<GLuint>(a_uv_), 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(2 * sizeof(float)));
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, video_tex_);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, video_tex);
     glUniform1i(u_video_, 0);
 
     glActiveTexture(GL_TEXTURE1);
@@ -219,14 +244,16 @@ void WarpGlRenderer::draw(const frame_warp::Warp& w, uint32_t frame_number, uint
     glUniform4f(u_warp_rect_, warp_rect_[0], warp_rect_[1], warp_rect_[2], warp_rect_[3]);
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#else
+    (void)video_tex;
 #endif
     last_drawn_px_ = w.active ? w.pixels : std::array<float, 2>{0.0f, 0.0f};
     last_drawn_frame_ = frame_number;
     last_input_seq_ = input_seq;
 }
 
-bool WarpGlRenderer::maybe_redraw_between_frames(frame_warp::FrameWarp& warp, uint64_t now_us) {
-    if (!last_drawn_frame_.has_value()) return false;
+bool WarpGlRenderer::maybe_redraw_between_frames(GLuint video_tex, frame_warp::FrameWarp& warp, uint64_t now_us) {
+    if (video_tex == 0 || !last_drawn_frame_.has_value()) return false;
     bool has_shift = (last_drawn_px_[0] != 0.0f || last_drawn_px_[1] != 0.0f);
     bool input_changed = warp.input_seq() != last_input_seq_;
     if (!has_shift && !input_changed && !warp.stick_deflected()) return false;
@@ -238,7 +265,7 @@ bool WarpGlRenderer::maybe_redraw_between_frames(frame_warp::FrameWarp& warp, ui
 
     auto committed = warp.warp(*last_drawn_frame_, now_us);
     sync_hud_mask(warp);
-    draw(committed, *last_drawn_frame_, warp.input_seq());
+    draw(video_tex, committed, *last_drawn_frame_, warp.input_seq());
     return true;
 }
 
@@ -247,7 +274,10 @@ void WarpGlRenderer::destroy() {
     if (webgl_ctx_ > 0) {
         emscripten_webgl_make_context_current(webgl_ctx_);
     }
-    if (video_tex_) { glDeleteTextures(1, &video_tex_); video_tex_ = 0; }
+    if (video_texs_[0] || video_texs_[1] || video_texs_[2]) {
+        glDeleteTextures(3, video_texs_.data());
+        video_texs_ = {0, 0, 0};
+    }
     if (mask_tex_) { glDeleteTextures(1, &mask_tex_); mask_tex_ = 0; }
     if (vbo_) { glDeleteBuffers(1, &vbo_); vbo_ = 0; }
     if (program_) { glDeleteProgram(program_); program_ = 0; }
@@ -255,6 +285,8 @@ void WarpGlRenderer::destroy() {
         emscripten_webgl_destroy_context(webgl_ctx_);
         webgl_ctx_ = 0;
     }
+    viewport_w_ = 0;
+    viewport_h_ = 0;
 #endif
 }
 

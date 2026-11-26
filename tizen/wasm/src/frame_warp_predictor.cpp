@@ -56,6 +56,24 @@ std::optional<uint32_t> FrameRing::lookup(int64_t pts_us) const {
     return std::nullopt;
 }
 
+std::optional<uint32_t> FrameRing::lookup_nearest(int64_t pts_us, int64_t tolerance_us) const {
+    std::optional<uint32_t> best;
+    int64_t best_diff = tolerance_us + 1;
+    for (size_t i = 0; i < kCapacity; ++i) {
+        size_t idx = (next_ + kCapacity - 1 - i) % kCapacity;
+        if (!entries_[idx].valid) continue;
+        int64_t diff = entries_[idx].pts_us >= pts_us
+            ? (entries_[idx].pts_us - pts_us)
+            : (pts_us - entries_[idx].pts_us);
+        if (diff <= tolerance_us && diff < best_diff) {
+            best_diff = diff;
+            best = entries_[idx].frame;
+            if (diff == 0) break;
+        }
+    }
+    return best;
+}
+
 void FrameRing::clear() {
     entries_.fill(Entry{});
     next_ = 0;
@@ -425,6 +443,11 @@ void FrameWarp::note_frame_pts(int64_t pts_us, uint32_t frame_number) {
 std::optional<uint32_t> FrameWarp::lookup_frame_pts(int64_t pts_us) {
     std::lock_guard<std::mutex> lock(mu_);
     return frame_ring_.lookup(pts_us);
+}
+
+std::optional<uint32_t> FrameWarp::lookup_frame_pts_nearest(int64_t pts_us, int64_t tolerance_us) {
+    std::lock_guard<std::mutex> lock(mu_);
+    return frame_ring_.lookup_nearest(pts_us, tolerance_us);
 }
 
 } // namespace nightjar::frame_warp

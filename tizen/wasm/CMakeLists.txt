@@ -142,6 +142,7 @@ else()
         src/codec_capabilities.cpp
         src/host_http_client.cpp
         src/tizen_audio_decoder.cpp
+        src/tizen_video_decoder.cpp
         src/warp_gl_renderer.cpp
         tests/frame_warp_test.cpp
     )

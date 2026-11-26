@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <random>
 #include <sstream>
 
 #ifdef NIGHTJAR_HAVE_CURL_OPENSSL
@@ -23,11 +25,37 @@ namespace nightjar::tizen {
 
 namespace {
 
+std::string generate_random_unique_id() {
+    static const char kHex[] = "0123456789abcdef";
+    uint8_t bytes[8]{};
+#ifdef NIGHTJAR_HAVE_CURL_OPENSSL
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        std::random_device rd;
+        for (uint8_t& b : bytes) b = static_cast<uint8_t>(rd() & 0xFFu);
+    }
+#else
+    std::random_device rd;
+    for (uint8_t& b : bytes) b = static_cast<uint8_t>(rd() & 0xFFu);
+#endif
+    std::string out;
+    out.reserve(16);
+    for (uint8_t b : bytes) {
+        out.push_back(kHex[(b >> 4) & 0xF]);
+        out.push_back(kHex[b & 0xF]);
+    }
+    return out;
+}
+
 #ifdef NIGHTJAR_HAVE_CURL_OPENSSL
 size_t curl_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* out = static_cast<std::string*>(userdata);
     out->append(static_cast<const char*>(ptr), size * nmemb);
     return size * nmemb;
+}
+
+int curl_xferinfo_cb(void* clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    auto* abort_flag = static_cast<const std::atomic<bool>*>(clientp);
+    return (abort_flag && abort_flag->load(std::memory_order_acquire)) ? 1 : 0;
 }
 
 std::string to_hex(const uint8_t* data, size_t len) {
@@ -80,24 +108,54 @@ std::vector<uint8_t> sha256_bytes(const uint8_t* data, size_t len) {
 struct SslMemIdentity {
     const std::string* cert_pem;
     const std::string* key_pem;
+    const std::string* pinned_server_cert_pem;
 };
+
+int verify_pinned_server_cert(X509_STORE_CTX* store_ctx, void* arg) {
+    auto* pinned_pem = static_cast<const std::string*>(arg);
+    if (!pinned_pem || pinned_pem->empty()) {
+        return 1; // Not paired/pinned yet
+    }
+    X509* peer = X509_STORE_CTX_get0_cert(store_ctx);
+    if (!peer) return 0;
+
+    BIO* pbio = BIO_new_mem_buf(pinned_pem->data(), static_cast<int>(pinned_pem->size()));
+    X509* pinned = PEM_read_bio_X509(pbio, nullptr, nullptr, nullptr);
+    BIO_free(pbio);
+    if (!pinned) return 0;
+
+    int eq = (X509_cmp(peer, pinned) == 0) ? 1 : 0;
+    X509_free(pinned);
+    return eq;
+}
 
 CURLcode ssl_ctx_cb(CURL* /*curl*/, void* ssl_ctx, void* userptr) {
     auto* id = static_cast<SslMemIdentity*>(userptr);
     auto* ctx = static_cast<SSL_CTX*>(ssl_ctx);
-    BIO* cbio = BIO_new_mem_buf(id->cert_pem->data(), static_cast<int>(id->cert_pem->size()));
-    X509* cert = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
-    BIO_free(cbio);
-    if (cert) {
-        SSL_CTX_use_certificate(ctx, cert);
-        X509_free(cert);
+    if (id->cert_pem && !id->cert_pem->empty()) {
+        BIO* cbio = BIO_new_mem_buf(id->cert_pem->data(), static_cast<int>(id->cert_pem->size()));
+        X509* cert = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
+        BIO_free(cbio);
+        if (cert) {
+            SSL_CTX_use_certificate(ctx, cert);
+            X509_free(cert);
+        }
     }
-    BIO* kbio = BIO_new_mem_buf(id->key_pem->data(), static_cast<int>(id->key_pem->size()));
-    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
-    BIO_free(kbio);
-    if (pkey) {
-        SSL_CTX_use_PrivateKey(ctx, pkey);
-        EVP_PKEY_free(pkey);
+    if (id->key_pem && !id->key_pem->empty()) {
+        BIO* kbio = BIO_new_mem_buf(id->key_pem->data(), static_cast<int>(id->key_pem->size()));
+        EVP_PKEY* pkey = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
+        BIO_free(kbio);
+        if (pkey) {
+            SSL_CTX_use_PrivateKey(ctx, pkey);
+            EVP_PKEY_free(pkey);
+        }
+    }
+    if (id->pinned_server_cert_pem && !id->pinned_server_cert_pem->empty()) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+        SSL_CTX_set_cert_verify_callback(
+            ctx,
+            verify_pinned_server_cert,
+            const_cast<std::string*>(id->pinned_server_cert_pem));
     }
     return CURLE_OK;
 }
@@ -107,6 +165,25 @@ CURLcode ssl_ctx_cb(CURL* /*curl*/, void* ssl_ctx, void* userptr) {
 
 HostHttpClient::HostHttpClient() = default;
 HostHttpClient::~HostHttpClient() = default;
+
+void HostHttpClient::set_pinned_server_cert(const std::string& host_ip, const std::string& cert_pem) {
+    std::lock_guard<std::mutex> lk(pin_mutex_);
+    if (cert_pem.empty()) {
+        pinned_certs_.erase(host_ip);
+    } else {
+        pinned_certs_[host_ip] = cert_pem;
+    }
+}
+
+std::string HostHttpClient::pinned_server_cert(const std::string& host_ip) const {
+    std::lock_guard<std::mutex> lk(pin_mutex_);
+    auto it = pinned_certs_.find(host_ip);
+    return it == pinned_certs_.end() ? std::string() : it->second;
+}
+
+void HostHttpClient::cancel_pending_pairing() {
+    cancel_pairing_.store(true, std::memory_order_release);
+}
 
 std::optional<std::string> HostHttpClient::extract_xml_tag(const std::string& xml, const std::string& tag) {
     std::string open = "<" + tag + ">";
@@ -128,6 +205,15 @@ int HostHttpClient::parse_frame_warp_version(const std::string& xml) {
     long parsed = std::strtol(val->c_str(), nullptr, 10);
     if (parsed < 1 || parsed > 65535) return 0;
     return static_cast<int>(parsed);
+}
+
+uint32_t HostHttpClient::parse_server_codec_mode_support(const std::string& xml) {
+    auto val = extract_xml_tag(xml, "ServerCodecModeSupport");
+    if (!val.has_value() || val->empty()) return 0;
+    for (char c : *val) {
+        if (c < '0' || c > '9') return 0;
+    }
+    return static_cast<uint32_t>(std::strtoul(val->c_str(), nullptr, 10));
 }
 
 std::vector<HostApp> HostHttpClient::parse_applist_xml(const std::string& xml) {
@@ -157,7 +243,9 @@ std::vector<HostApp> HostHttpClient::parse_applist_xml(const std::string& xml) {
 
 bool HostHttpClient::init_identity(
     const std::string& unique_id, const std::string& cert_pem, const std::string& key_pem) {
-    identity_.unique_id = unique_id.empty() ? "0123456789ABCDEF" : unique_id;
+    identity_.unique_id = (unique_id.empty() || unique_id == "0123456789ABCDEF")
+        ? generate_random_unique_id()
+        : unique_id;
     if (!cert_pem.empty() && !key_pem.empty()) {
         identity_.cert_pem = cert_pem;
         identity_.key_pem = key_pem;
@@ -180,7 +268,7 @@ bool HostHttpClient::init_identity(
     X509_gmtime_adj(X509_get_notAfter(x509), 60L * 60L * 24L * 3650L);
     X509_set_pubkey(x509, pkey);
     X509_NAME* name = X509_get_subject_name(x509);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("Nightjar-Tizen"), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("Nightjar"), -1, -1, 0);
     X509_set_issuer_name(x509, name);
     X509_sign(x509, pkey, EVP_sha256());
 
@@ -208,7 +296,14 @@ bool HostHttpClient::init_identity(
 #endif
 }
 
-bool HostHttpClient::http_get(const std::string& url, bool use_mtls, std::string& out_body, std::string& out_err) {
+bool HostHttpClient::http_get(
+    const std::string& url,
+    const std::string& host_ip,
+    bool use_mtls,
+    std::string& out_body,
+    std::string& out_err,
+    long timeout_sec,
+    const std::atomic<bool>* abort_flag) {
 #ifdef NIGHTJAR_HAVE_CURL_OPENSSL
     CURL* curl = curl_easy_init();
     if (!curl) {
@@ -220,19 +315,28 @@ bool HostHttpClient::http_get(const std::string& url, bool use_mtls, std::string
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out_body);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 
-    SslMemIdentity mem_id{&identity_.cert_pem, &identity_.key_pem};
+    std::string pinned = use_mtls ? pinned_server_cert(host_ip) : std::string();
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, pinned.empty() ? 0L : 1L);
+
+    SslMemIdentity mem_id{&identity_.cert_pem, &identity_.key_pem, &pinned};
     if (use_mtls && !identity_.cert_pem.empty()) {
         curl_easy_setopt(curl, CURLOPT_SSL_CTX_FUNCTION, ssl_ctx_cb);
         curl_easy_setopt(curl, CURLOPT_SSL_CTX_DATA, &mem_id);
     }
 
+    if (abort_flag) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_xferinfo_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, const_cast<std::atomic<bool>*>(abort_flag));
+    }
+
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        out_err = curl_easy_strerror(res);
+        out_err = (res == CURLE_ABORTED_BY_CALLBACK) ? "Cancelled" : curl_easy_strerror(res);
         curl_easy_cleanup(curl);
         return false;
     }
@@ -240,11 +344,21 @@ bool HostHttpClient::http_get(const std::string& url, bool use_mtls, std::string
     return true;
 #else
     (void)url;
+    (void)host_ip;
     (void)use_mtls;
     (void)out_body;
+    (void)timeout_sec;
+    (void)abort_flag;
     out_err = "Compiled without OpenSSL/libcurl";
     return false;
 #endif
+}
+
+bool HostHttpClient::unpair(const std::string& host_ip, uint16_t http_port) {
+    std::string body, err;
+    std::string url = "http://" + host_ip + ":" + std::to_string(http_port) +
+                      "/unpair?uniqueid=" + identity_.unique_id;
+    return http_get(url, host_ip, false, body, err, 5L);
 }
 
 ServerInfo HostHttpClient::fetch_serverinfo(const std::string& host_ip, uint16_t http_port, uint16_t https_port) {
@@ -252,11 +366,11 @@ ServerInfo HostHttpClient::fetch_serverinfo(const std::string& host_ip, uint16_t
     std::string body, err;
     std::string https_url = "https://" + host_ip + ":" + std::to_string(https_port) +
                             "/serverinfo?uniqueid=" + identity_.unique_id;
-    bool ok = http_get(https_url, true, body, err);
+    bool ok = http_get(https_url, host_ip, true, body, err);
     if (!ok) {
         std::string http_url = "http://" + host_ip + ":" + std::to_string(http_port) +
                                "/serverinfo?uniqueid=" + identity_.unique_id;
-        ok = http_get(http_url, false, body, err);
+        ok = http_get(http_url, host_ip, false, body, err);
     }
     if (!ok) {
         info.raw_error = err;
@@ -269,12 +383,21 @@ ServerInfo HostHttpClient::fetch_serverinfo(const std::string& host_ip, uint16_t
     if (auto v = extract_xml_tag(body, "PairStatus")) info.paired = (*v == "1");
     if (auto v = extract_xml_tag(body, "currentgame")) info.current_game = std::atoi(v->c_str());
     info.frame_warp_version = parse_frame_warp_version(body);
+    info.server_codec_mode_support = parse_server_codec_mode_support(body);
     return info;
 }
 
 bool HostHttpClient::pair_with_pin(
     const std::string& host_ip, const std::string& pin, std::string& out_error, uint16_t http_port, uint16_t https_port) {
 #ifdef NIGHTJAR_HAVE_CURL_OPENSSL
+    cancel_pairing_.store(false, std::memory_order_release);
+
+    auto fail_and_unpair = [&](const std::string& msg) {
+        out_error = msg;
+        unpair(host_ip, http_port);
+        return false;
+    };
+
     // Step 1: Generate 16-byte salt & derive AES-128 key = SHA-256(salt || pin)[0..16]
     uint8_t salt[16];
     RAND_bytes(salt, sizeof(salt));
@@ -285,53 +408,74 @@ bool HostHttpClient::pair_with_pin(
     std::memcpy(aes_key, key_hash.data(), 16);
 
     std::string base_http = "http://" + host_ip + ":" + std::to_string(http_port) +
-                            "/pair?uniqueid=" + identity_.unique_id + "&devicename=Nightjar-Tizen&updateState=1";
+                            "/pair?uniqueid=" + identity_.unique_id + "&devicename=Nightjar&updateState=1";
     std::string cert_hex = to_hex(reinterpret_cast<const uint8_t*>(identity_.cert_pem.data()), identity_.cert_pem.size());
 
-    // Step 2: getservercert
+    // Step 2: getservercert (long 120s timeout while user enters PIN on host)
     std::string body;
-    if (!http_get(base_http + "&phrase=getservercert&salt=" + to_hex(salt, 16) + "&clientcert=" + cert_hex, false, body, out_error)) {
-        return false;
+    if (!http_get(
+            base_http + "&phrase=getservercert&salt=" + to_hex(salt, 16) + "&clientcert=" + cert_hex,
+            host_ip,
+            false,
+            body,
+            out_error,
+            120L,
+            &cancel_pairing_)) {
+        return fail_and_unpair(out_error);
+    }
+    auto paired_step = extract_xml_tag(body, "paired");
+    if (!paired_step || *paired_step != "1") {
+        return fail_and_unpair("Host rejected PIN or is already pairing");
     }
     auto plaincert_hex = extract_xml_tag(body, "plaincert");
     if (!plaincert_hex) {
-        out_error = "Host did not return plaincert (PIN rejected or already pairing)";
-        return false;
+        return fail_and_unpair("Host did not return plaincert");
     }
     auto server_cert_bytes = from_hex(*plaincert_hex);
+    std::string server_cert_pem(reinterpret_cast<const char*>(server_cert_bytes.data()), server_cert_bytes.size());
+
     BIO* sbio = BIO_new_mem_buf(server_cert_bytes.data(), static_cast<int>(server_cert_bytes.size()));
     X509* server_x509 = PEM_read_bio_X509(sbio, nullptr, nullptr, nullptr);
     BIO_free(sbio);
     if (!server_x509) {
-        out_error = "Failed to parse server X509 cert";
-        return false;
+        return fail_and_unpair("Failed to parse server X509 cert");
     }
 
     // Step 3: clientchallenge
     std::vector<uint8_t> client_challenge(16);
     RAND_bytes(client_challenge.data(), 16);
     auto enc_challenge = aes_ecb_crypt(aes_key, client_challenge, true);
-    if (!http_get(base_http + "&clientchallenge=" + to_hex(enc_challenge.data(), enc_challenge.size()), false, body, out_error)) {
+    if (!http_get(
+            base_http + "&clientchallenge=" + to_hex(enc_challenge.data(), enc_challenge.size()),
+            host_ip,
+            false,
+            body,
+            out_error,
+            15L,
+            &cancel_pairing_)) {
         X509_free(server_x509);
-        return false;
+        return fail_and_unpair(out_error);
+    }
+    paired_step = extract_xml_tag(body, "paired");
+    if (!paired_step || *paired_step != "1") {
+        X509_free(server_x509);
+        return fail_and_unpair("Host rejected clientchallenge");
     }
     auto chall_resp_hex = extract_xml_tag(body, "challengeresponse");
     if (!chall_resp_hex) {
         X509_free(server_x509);
-        out_error = "Missing challengeresponse from host";
-        return false;
+        return fail_and_unpair("Missing challengeresponse from host");
     }
     auto dec_resp = aes_ecb_crypt(aes_key, from_hex(*chall_resp_hex), false);
     if (dec_resp.size() < 48) {
         X509_free(server_x509);
-        out_error = "Short decrypted challengeresponse";
-        return false;
+        return fail_and_unpair("Short decrypted challengeresponse");
     }
-    // server_challenge = dec_resp[32..48]
+    std::vector<uint8_t> server_response_hash(dec_resp.begin(), dec_resp.begin() + 32);
+
     std::vector<uint8_t> client_secret(16);
     RAND_bytes(client_secret.data(), 16);
 
-    // Extract client cert signature for serverchallengeresp
     BIO* cbio = BIO_new_mem_buf(identity_.cert_pem.data(), static_cast<int>(identity_.cert_pem.size()));
     X509* client_x509 = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
     BIO_free(cbio);
@@ -344,13 +488,59 @@ bool HostHttpClient::pair_with_pin(
     hash_input.insert(hash_input.end(), client_secret.begin(), client_secret.end());
     auto client_resp_hash = sha256_bytes(hash_input.data(), hash_input.size());
     auto enc_client_resp = aes_ecb_crypt(aes_key, client_resp_hash, true);
-
     X509_free(client_x509);
-    X509_free(server_x509);
 
-    // Step 4: serverchallengeresp
-    if (!http_get(base_http + "&serverchallengeresp=" + to_hex(enc_client_resp.data(), enc_client_resp.size()), false, body, out_error)) {
-        return false;
+    // Step 4: serverchallengeresp -> verify server's pairingsecret & RSA signature
+    if (!http_get(
+            base_http + "&serverchallengeresp=" + to_hex(enc_client_resp.data(), enc_client_resp.size()),
+            host_ip,
+            false,
+            body,
+            out_error,
+            15L,
+            &cancel_pairing_)) {
+        X509_free(server_x509);
+        return fail_and_unpair(out_error);
+    }
+    paired_step = extract_xml_tag(body, "paired");
+    auto pairing_secret_hex = extract_xml_tag(body, "pairingsecret");
+    if (!paired_step || *paired_step != "1" || !pairing_secret_hex) {
+        X509_free(server_x509);
+        return fail_and_unpair("Host rejected serverchallengeresp");
+    }
+    auto srv_pairing_secret = from_hex(*pairing_secret_hex);
+    if (srv_pairing_secret.size() <= 16) {
+        X509_free(server_x509);
+        return fail_and_unpair("Invalid server pairingsecret length");
+    }
+
+    // Verify server_response_hash == SHA256(client_challenge || server_cert_sig || server_secret)
+    const ASN1_BIT_STRING* server_sig = nullptr;
+    X509_get0_signature(&server_sig, nullptr, server_x509);
+    std::vector<uint8_t> srv_hash_in;
+    srv_hash_in.insert(srv_hash_in.end(), client_challenge.begin(), client_challenge.end());
+    srv_hash_in.insert(srv_hash_in.end(), server_sig->data, server_sig->data + server_sig->length);
+    srv_hash_in.insert(srv_hash_in.end(), srv_pairing_secret.begin(), srv_pairing_secret.begin() + 16);
+    auto expected_srv_hash = sha256_bytes(srv_hash_in.data(), srv_hash_in.size());
+    if (expected_srv_hash != server_response_hash) {
+        X509_free(server_x509);
+        return fail_and_unpair("Server challenge hash mismatch (wrong PIN or MITM)");
+    }
+
+    // Verify server RSA signature over server_secret[0..16]
+    EVP_PKEY* srv_pub = X509_get0_pubkey(server_x509);
+    EVP_MD_CTX* vctx = EVP_MD_CTX_new();
+    bool sig_ok = false;
+    if (srv_pub && vctx &&
+        EVP_DigestVerifyInit(vctx, nullptr, EVP_sha256(), nullptr, srv_pub) == 1 &&
+        EVP_DigestVerifyUpdate(vctx, srv_pairing_secret.data(), 16) == 1 &&
+        EVP_DigestVerifyFinal(vctx, srv_pairing_secret.data() + 16, srv_pairing_secret.size() - 16) == 1) {
+        sig_ok = true;
+    }
+    if (vctx) EVP_MD_CTX_free(vctx);
+    X509_free(server_x509);
+    if (!sig_ok) {
+        return fail_and_unpair("Server pairing signature verification failed");
     }
 
     // Step 5: sign client_secret with client private key and send clientpairingsecret
@@ -369,20 +559,31 @@ bool HostHttpClient::pair_with_pin(
 
     std::vector<uint8_t> pairing_secret = client_secret;
     pairing_secret.insert(pairing_secret.end(), secret_sig.begin(), secret_sig.begin() + sig_len);
-    if (!http_get(base_http + "&clientpairingsecret=" + to_hex(pairing_secret.data(), pairing_secret.size()), false, body, out_error)) {
-        return false;
+    if (!http_get(
+            base_http + "&clientpairingsecret=" + to_hex(pairing_secret.data(), pairing_secret.size()),
+            host_ip,
+            false,
+            body,
+            out_error,
+            15L,
+            &cancel_pairing_)) {
+        return fail_and_unpair(out_error);
     }
+
+    // Pin verified server certificate before HTTPS pairchallenge
+    set_pinned_server_cert(host_ip, server_cert_pem);
 
     // Step 6: HTTPS pairchallenge
     std::string https_pair = "https://" + host_ip + ":" + std::to_string(https_port) +
-                             "/pair?uniqueid=" + identity_.unique_id + "&devicename=Nightjar-Tizen&updateState=1&phrase=pairchallenge";
-    if (!http_get(https_pair, true, body, out_error)) {
-        return false;
+                             "/pair?uniqueid=" + identity_.unique_id + "&devicename=Nightjar&updateState=1&phrase=pairchallenge";
+    if (!http_get(https_pair, host_ip, true, body, out_error, 15L, &cancel_pairing_)) {
+        set_pinned_server_cert(host_ip, "");
+        return fail_and_unpair(out_error);
     }
     auto paired = extract_xml_tag(body, "paired");
     if (!paired || *paired != "1") {
-        out_error = "HTTPS pairchallenge did not confirm paired=1";
-        return false;
+        set_pinned_server_cert(host_ip, "");
+        return fail_and_unpair("HTTPS pairchallenge did not confirm paired=1");
     }
     return true;
 #else
@@ -396,7 +597,7 @@ std::vector<HostApp> HostHttpClient::fetch_applist(const std::string& host_ip, s
     std::string body;
     std::string url = "https://" + host_ip + ":" + std::to_string(https_port) +
                       "/applist?uniqueid=" + identity_.unique_id;
-    if (!http_get(url, true, body, out_error)) {
+    if (!http_get(url, host_ip, true, body, out_error)) {
         return {};
     }
     return parse_applist_xml(body);
@@ -411,8 +612,14 @@ LaunchResult HostHttpClient::launch_or_resume(
     const std::string& rikey_hex,
     uint32_t rikeyid,
     bool resume,
+    uint32_t active_gamepad_mask,
+    bool hdr,
+    bool surround51,
     uint16_t https_port) {
     LaunchResult res;
+    uint32_t pad_mask = active_gamepad_mask ? active_gamepad_mask : 1u;
+    uint32_t surround_info = surround51 ? 458758u : 196610u; // 0x70006 (5.1) vs 0x30002 (stereo)
+
     std::ostringstream url;
     url << "https://" << host_ip << ":" << https_port
         << (resume ? "/resume" : "/launch")
@@ -422,10 +629,14 @@ LaunchResult HostHttpClient::launch_or_resume(
         << "&additionalStates=1&sops=0"
         << "&rikey=" << rikey_hex
         << "&rikeyid=" << rikeyid
-        << "&localAudioPlayMode=0&surroundAudioInfo=196610&remoteControllersBitmap=1&gcmap=1";
+        << "&hdrMode=" << (hdr ? 1 : 0)
+        << "&localAudioPlayMode=0"
+        << "&surroundAudioInfo=" << surround_info
+        << "&remoteControllersBitmap=" << pad_mask
+        << "&gcmap=" << pad_mask;
 
     std::string body, err;
-    if (!http_get(url.str(), true, body, err)) {
+    if (!http_get(url.str(), host_ip, true, body, err, 20L)) {
         res.error = err;
         return res;
     }
@@ -443,7 +654,7 @@ bool HostHttpClient::cancel_app(const std::string& host_ip, uint16_t https_port)
     std::string body, err;
     std::string url = "https://" + host_ip + ":" + std::to_string(https_port) +
                       "/cancel?uniqueid=" + identity_.unique_id;
-    return http_get(url, true, body, err);
+    return http_get(url, host_ip, true, body, err);
 }
 
 } // namespace nightjar::tizen

@@ -83,6 +83,7 @@ if(EMSCRIPTEN)
 
     add_executable(nightjar_tizen
         src/libchelper.c
+        src/codec_capabilities.cpp
         src/host_http_client.cpp
         src/tizen_video_decoder.cpp
         src/warp_gl_renderer.cpp
@@ -122,6 +123,7 @@ if(EMSCRIPTEN)
 else()
     enable_testing()
     add_executable(frame_warp_cpp_test
+        src/codec_capabilities.cpp
         src/host_http_client.cpp
         src/warp_gl_renderer.cpp
         tests/frame_warp_test.cpp

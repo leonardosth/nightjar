@@ -38,7 +38,7 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len);
         limelight_h.write_text(h_text, encoding="utf-8")
         print(f"Patched {limelight_h}")
 
-    # 2. RtspConnection.c — detect 0x5543 on a=x-rl-control in RTSP DESCRIBE response
+    # 2. RtspConnection.c — strict token parse of 0x5543 on a=x-rl-control in RTSP DESCRIBE response
     rtsp_path = src / "RtspConnection.c"
     rtsp_text = rtsp_path.read_text(encoding="utf-8")
     if "g_hasFrameWarpControl" not in rtsp_text:
@@ -46,6 +46,38 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len);
             '#include "Limelight-internal.h"\n'
             "static bool g_hasFrameWarpControl = false;\n"
             "bool LiHasFrameWarpControl(void) { return g_hasFrameWarpControl; }\n"
+            "static bool rlHasFrameWarpControl(const char* sdp) {\n"
+            "    if (!sdp) return false;\n"
+            "    const char* p = sdp;\n"
+            "    while (*p) {\n"
+            "        const char* nl = strchr(p, '\\n');\n"
+            "        size_t len = nl ? (size_t)(nl - p) : strlen(p);\n"
+            "        if (len > 0 && p[len - 1] == '\\r') len--;\n"
+            "        if (len >= 15 && strncmp(p, \"a=x-rl-control:\", 15) == 0) {\n"
+            "            const char* cur = p + 15;\n"
+            "            const char* end = p + len;\n"
+            "            while (cur < end) {\n"
+            "                const char* comma = memchr(cur, ',', (size_t)(end - cur));\n"
+            "                const char* tok_end = comma ? comma : end;\n"
+            "                while (cur < tok_end && (*cur == ' ' || *cur == '\\t')) cur++;\n"
+            "                const char* trim_end = tok_end;\n"
+            "                while (trim_end > cur && (trim_end[-1] == ' ' || trim_end[-1] == '\\t')) trim_end--;\n"
+            "                size_t tlen = (size_t)(trim_end - cur);\n"
+            "                if (tlen > 0 && tlen < 16) {\n"
+            "                    char buf[16];\n"
+            "                    memcpy(buf, cur, tlen);\n"
+            "                    buf[tlen] = '\\0';\n"
+            "                    char* endp = NULL;\n"
+            "                    unsigned long v = strtoul(buf, &endp, 0);\n"
+            "                    if (endp && *endp == '\\0' && v == 0x5543ul) return true;\n"
+            "                }\n"
+            "                cur = comma ? (comma + 1) : end;\n"
+            "            }\n"
+            "        }\n"
+            "        p = nl ? (nl + 1) : (p + strlen(p));\n"
+            "    }\n"
+            "    return false;\n"
+            "}\n"
         )
         rtsp_text = rtsp_text.replace('#include "Limelight-internal.h"', rtsp_header, 1)
         rfi_anchor = 'ReferenceFrameInvalidationSupported = strstr(response.payload, "x-nv-video[0].refPicInvalidation") != NULL;'
@@ -54,9 +86,16 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len);
         rtsp_text = rtsp_text.replace(
             rfi_anchor,
             rfi_anchor
-            + '\n        g_hasFrameWarpControl = (strstr(response.payload, "a=x-rl-control:") != NULL && strstr(response.payload, "0x5543") != NULL);',
+            + '\n        g_hasFrameWarpControl = rlHasFrameWarpControl(response.payload);',
             1,
         )
+        handshake_anchor = "int performRtspHandshake(PSERVER_INFORMATION serverInfo) {"
+        if handshake_anchor in rtsp_text:
+            rtsp_text = rtsp_text.replace(
+                handshake_anchor,
+                handshake_anchor + "\n    g_hasFrameWarpControl = false;",
+                1,
+            )
         rtsp_path.write_text(rtsp_text, encoding="utf-8")
         print(f"Patched {rtsp_path}")
 

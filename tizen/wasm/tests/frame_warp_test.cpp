@@ -1,3 +1,4 @@
+#include "codec_capabilities.hpp"
 #include "frame_warp_predictor.hpp"
 #include "frame_warp_protocol.hpp"
 #include "host_http_client.hpp"
@@ -73,6 +74,31 @@ int main() {
     std::string apps_xml = "<root><App><ID>101</ID><AppTitle>Desktop</AppTitle><IsHdrSupported>1</IsHdrSupported></App></root>";
     auto apps = HostHttpClient::parse_applist_xml(apps_xml);
     assert(apps.size() == 1 && apps[0].id == 101 && apps[0].title == "Desktop" && apps[0].hdr_supported);
+
+    // 6. Codec MIME levels for 4K60, 4K120, HDR10
+    assert(build_video_mime("hevc", 3840, 2160, 60, false) == "video/mp4; codecs=\"hev1.1.6.L153.B0\"");
+    assert(build_video_mime("hevc", 3840, 2160, 120, false) == "video/mp4; codecs=\"hev1.1.6.L156.B0\"");
+    assert(build_video_mime("hevc", 3840, 2160, 120, true) == "video/mp4; codecs=\"hev1.2.4.L156.B0\"");
+    assert(build_video_mime("av1", 3840, 2160, 120, false) == "video/mp4; codecs=\"av01.0.13M.08\"");
+    assert(build_video_mime("av1", 3840, 2160, 120, true) == "video/mp4; codecs=\"av01.0.13M.10\"");
+    assert(build_video_mime("h264", 1920, 1080, 120, false) == "video/mp4; codecs=\"avc1.640032\"");
+
+    // 7. Strict RTSP DESCRIBE control parsing
+    assert(sdp_offers_frame_warp("a=x-rl-control:0x5530, 0x5543, 0x5544\r\n"));
+    assert(sdp_offers_frame_warp("a=x-rl-control:21827\n"));
+    assert(!sdp_offers_frame_warp("a=x-other:0x5543\r\n"));
+    assert(!sdp_offers_frame_warp("a=x-rl-control:0x55430\r\n"));
+
+    // 8. ServerCodecModeSupport & non-constant random unique_id
+    assert(HostHttpClient::parse_server_codec_mode_support(
+               "<root><ServerCodecModeSupport>262915</ServerCodecModeSupport></root>") == 262915u);
+    HostHttpClient c1, c2;
+    c1.init_identity("", "", "");
+    c2.init_identity("", "", "");
+    assert(c1.identity().unique_id.size() == 16 && c1.identity().unique_id != "0123456789ABCDEF");
+    assert(c1.identity().unique_id != c2.identity().unique_id);
+    c1.set_pinned_server_cert("192.168.1.50", "CERT_PEM");
+    assert(c1.pinned_server_cert("192.168.1.50") == "CERT_PEM");
 
     std::cout << "All C++ Frame Warp & HostHttpClient tests passed!\n";
     return 0;

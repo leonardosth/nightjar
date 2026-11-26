@@ -8,6 +8,13 @@ import {
   WasmStreamSession,
 } from '../app/js/wasm-bridge.js';
 import { InputManager, TIZEN_KEY_BACK } from '../app/js/input-manager.js';
+import {
+  MOONLIGHT_BUTTONS,
+  mapStandardGamepad,
+  computeActiveGamepadMask,
+  shouldSendGamepadState,
+  pickSpatialFocus,
+} from '../app/js/gamepad-mapping.js';
 
 test('detectWasmEngine does not enter infinite microtask loop with Samsung Emscripten 1.39.4.7 Module.then', async () => {
   let thenCalls = 0;
@@ -227,4 +234,56 @@ test('WASM network helpers dispatch via non-blocking pthread job queue instead o
 
   assert.equal(mainThreadBlocked, false);
 });
+
+test('mapStandardGamepad maps W3C standard buttons to Moonlight wire flags and excludes analog triggers from button bits', () => {
+  const buttons = Array.from({ length: 18 }, () => ({ pressed: false, value: 0 }));
+  buttons[0] = { pressed: true, value: 1 };   // A
+  buttons[1] = { pressed: true, value: 1 };   // B
+  buttons[6] = { pressed: true, value: 0.5 }; // LT (must NOT set 0x0040 LS_CLK)
+  buttons[7] = { pressed: true, value: 1.0 }; // RT (must NOT set 0x0080 RS_CLK)
+  buttons[12] = { pressed: true, value: 1 };  // D-Pad Up
+  buttons[16] = { pressed: true, value: 1 };  // Guide
+
+  const state = mapStandardGamepad({
+    mapping: 'standard',
+    axes: [0.5, -1.0, -0.5, 1.0],
+    buttons,
+  });
+
+  assert.equal(
+    state.buttons,
+    MOONLIGHT_BUTTONS.A | MOONLIGHT_BUTTONS.B | MOONLIGHT_BUTTONS.UP | MOONLIGHT_BUTTONS.SPECIAL
+  );
+  assert.equal(state.leftTrigger, 128);
+  assert.equal(state.rightTrigger, 255);
+  assert.equal(state.leftStickX, 16384);
+  assert.equal(state.leftStickY, 32767);
+  assert.equal(state.rightStickX, -16384);
+  assert.equal(state.rightStickY, -32767);
+});
+
+test('computeActiveGamepadMask and shouldSendGamepadState track multiple pads and suppress idle duplicates', () => {
+  const mask = computeActiveGamepadMask([{ connected: true }, null, { connected: true }, { connected: false }]);
+  assert.equal(mask, 0b0101);
+
+  const s1 = { buttons: 0, leftTrigger: 0, rightTrigger: 0, leftStickX: 0, leftStickY: 0, rightStickX: 0, rightStickY: 0 };
+  assert.equal(shouldSendGamepadState(null, s1, 100), true);
+  assert.equal(shouldSendGamepadState({ ...s1, sentAt: 100 }, s1, 150), false);
+  assert.equal(shouldSendGamepadState({ ...s1, sentAt: 100 }, s1, 360), true); // >= 250ms heartbeat
+  assert.equal(shouldSendGamepadState({ ...s1, sentAt: 100 }, { ...s1, rightStickX: 400 }, 108), true);
+});
+
+test('pickSpatialFocus moves across 2D grid rows and columns instead of linear wrap', () => {
+  const rects = [
+    { left: 0, top: 0, width: 300, height: 150 },   // 0: row 0 col 0
+    { left: 340, top: 0, width: 300, height: 150 }, // 1: row 0 col 1
+    { left: 0, top: 180, width: 300, height: 150 }, // 2: row 1 col 0
+    { left: 340, top: 180, width: 300, height: 150 }, // 3: row 1 col 1
+  ];
+  assert.equal(pickSpatialFocus(rects, 0, 'down'), 2);
+  assert.equal(pickSpatialFocus(rects, 0, 'right'), 1);
+  assert.equal(pickSpatialFocus(rects, 3, 'up'), 1);
+  assert.equal(pickSpatialFocus(rects, 3, 'left'), 2);
+});
+
 

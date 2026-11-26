@@ -4,7 +4,10 @@ import {
   detectWasmEngine,
   probeHostAsync,
   pairHostAsync,
+  cancelPairingAsync,
   listAppsAsync,
+  cancelHostAppAsync,
+  generatePairingPin,
   WasmStreamSession,
 } from '../app/js/wasm-bridge.js';
 import { InputManager, TIZEN_KEY_BACK } from '../app/js/input-manager.js';
@@ -322,6 +325,79 @@ test('migrateSettings clears retired fwLens and fwMaskWidth keys and applies saf
   assert.equal(migrated.bitrate, '150');
   assert.equal(migrated.hdr, false);
   assert.equal(migrated.surround51, false);
+});
+
+test('generatePairingPin produces 4 digits and cancelPairingAsync aborts pending pair job', async () => {
+  const pin = generatePairingPin();
+  assert.match(pin, /^\d{4}$/);
+
+  let cancelledOp = false;
+  const runtime = {
+    startAsyncJob(op) {
+      if (op === 'cancel_pair') cancelledOp = true;
+      return 1;
+    },
+    pollAsyncJob() {
+      return JSON.stringify({ done: true, payload: { ok: true } });
+    },
+  };
+  await cancelPairingAsync(runtime);
+  assert.equal(cancelledOp, true);
+});
+
+test('WasmStreamSession polls termination events and invokes onTerminated with error code', async () => {
+  const origDocument = globalThis.document;
+  try {
+    const fakeCanvas = { width: 1920, height: 1080, style: {} };
+    const fakeVideo = { className: '' };
+    globalThis.document = {
+      getElementById: (id) => (id === 'stream-canvas' ? fakeCanvas : id === 'tizen-video-sink' ? fakeVideo : null),
+    };
+
+    let pollCount = 0;
+    let shutdownCalled = false;
+    let stopJobStarted = false;
+    const runtime = {
+      prepareStreamMedia: () => true,
+      startStreamLoop: () => {},
+      shutdownMedia: () => { shutdownCalled = true; },
+      startAsyncJob(op) {
+        if (op === 'stop_stream') stopJobStarted = true;
+        return 1;
+      },
+      pollAsyncJob() {
+        return JSON.stringify({ done: true, payload: { ok: true } });
+      },
+      getFrameWarpStatus() {
+        return JSON.stringify({ negotiated: true, locked: false, rxFps: 120, decodedFps: 120, renderedFps: 120 });
+      },
+      pollSessionEvents() {
+        pollCount++;
+        if (pollCount === 1) return JSON.stringify([{ type: 'terminated', code: -100 }]);
+        return '[]';
+      },
+    };
+
+    const session = new WasmStreamSession(
+      runtime,
+      { name: 'Host', address: '192.168.1.50', frameWarpVersion: 1 },
+      101,
+      { resolution: '3840x2160', fps: '120', codec: 'hevc', bitrate: '150', hdr: false, surround51: false, fwEnabled: true }
+    );
+
+    let terminatedCode = null;
+    await session.start(() => {}, { onTerminated: (code) => { terminatedCode = code; } });
+    assert.equal(fakeCanvas.width, 3840, '4K Frame Warp stream must resize canvas drawing buffer to 3840x2160');
+    assert.equal(fakeCanvas.height, 2160);
+
+    await new Promise((r) => setTimeout(r, 140));
+    assert.equal(terminatedCode, -100);
+    await session.stop();
+    assert.equal(shutdownCalled, true);
+    assert.equal(stopJobStarted, true);
+  } finally {
+    globalThis.document = origDocument;
+  }
 });
 
 

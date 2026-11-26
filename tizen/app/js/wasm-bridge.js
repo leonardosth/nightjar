@@ -1,14 +1,9 @@
 /**
- * Nightjar Tizen WASM Bridge + Rubylight Frame Warp Live Simulator
+ * Nightjar Tizen WASM Bridge + Offline Frame Warp Simulator
  *
- * When compiled with Samsung Emscripten SDK (tizen/wasm/), `window.NightjarWasm`
+ * When compiled with Samsung Emscripten SDK (tizen/wasm/), `window.NightjarWasmModule`
  * provides direct Tizen Sockets Extension (TCP/UDP/ENet/RTP) + Tizen WASM Player
- * (`ElementaryMediaStreamSource` with `LatencyMode::kUltraLow` and `RenderingMode::kVideoTexture`).
- *
- * When running without the compiled `.wasm` binary (e.g., UI testing or Frame Warp Lab),
- * `FrameWarpDemoSession` runs a realistic simulated Rubylight host with 45 ms end-to-end
- * lag emitting real binary 0x5544 Model, 0x5545 Tags, and 0x5546 LEB128 RLE HUD Mask packets
- * through the exact Frame Warp v1 predictor and WebGL 2.0 shader.
+ * (`ElementaryMediaStreamSource` with `LatencyMode::kUltraLow`, dual `kVideoTexture`/`kMediaElement`).
  */
 
 import {
@@ -20,6 +15,44 @@ import {
 } from './frame-warp.js';
 
 const STORAGE_IDENTITY = 'nightjar.tizen.identity.v1';
+
+export function generatePairingPin() {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const arr = new Uint32Array(1);
+    crypto.getRandomValues(arr);
+    return String(arr[0] % 10000).padStart(4, '0');
+  }
+  return String(Math.floor(Math.random() * 10000)).padStart(4, '0');
+}
+
+export async function runWasmJobAsync(
+  runtime,
+  op,
+  arg1 = '',
+  arg2 = '',
+  arg3 = '',
+  { timeoutMs = 15000, signal = null } = {}
+) {
+  if (!runtime || typeof runtime.startAsyncJob !== 'function' || typeof runtime.pollAsyncJob !== 'function') {
+    throw new Error('WASM runtime requires pthread async job support (rebuild tizen/wasm)');
+  }
+  const jobId = runtime.startAsyncJob(op, String(arg1), String(arg2), String(arg3));
+  const startedAt = Date.now();
+  while (true) {
+    if (signal && signal.aborted) {
+      throw new Error('Cancelled');
+    }
+    const raw = runtime.pollAsyncJob(jobId);
+    const parsed = JSON.parse(raw);
+    if (parsed.done) {
+      return parsed.payload;
+    }
+    if (timeoutMs > 0 && (Date.now() - startedAt) > timeoutMs) {
+      throw new Error(`Operation "${op}" timed out`);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
 
 export async function detectWasmEngine() {
   try {
@@ -61,7 +94,6 @@ export async function detectWasmEngine() {
           canvas: document.getElementById('stream-canvas'),
           locateFile: (path) => `wasm/${path}`,
           onRuntimeInitialized() {
-            // If called synchronously inside NightjarWasmModule(), `instance` is assigned right after
             Promise.resolve().then(() => finish(instance));
           },
           onAbort(reason) {
@@ -87,10 +119,7 @@ export async function detectWasmEngine() {
       }
     });
 
-    // Yield a macrotask before RSA/X.509 identity setup so initial TV UI paint & input stay responsive
-    await new Promise((r) => setTimeout(r, 0));
-
-    // Initialize or restore persistent RSA-2048/X.509 client identity
+    // Initialize or restore persistent RSA-2048/X.509 client identity off the main thread
     let stored = { uniqueId: '', certPem: '', keyPem: '' };
     try {
       const raw = localStorage.getItem(STORAGE_IDENTITY);
@@ -98,11 +127,27 @@ export async function detectWasmEngine() {
     } catch {
       // ignore
     }
-    const idJson = mod.initIdentity(stored.uniqueId || '', stored.certPem || '', stored.keyPem || '');
-    try {
-      localStorage.setItem(STORAGE_IDENTITY, idJson);
-    } catch {
-      // ignore
+
+    let idPayload = null;
+    if (typeof mod.startAsyncJob === 'function' && typeof mod.pollAsyncJob === 'function') {
+      idPayload = await runWasmJobAsync(
+        mod,
+        'init_identity',
+        stored.uniqueId || '',
+        stored.certPem || '',
+        stored.keyPem || '',
+        { timeoutMs: 30000 }
+      );
+    } else if (typeof mod.initIdentity === 'function') {
+      idPayload = JSON.parse(mod.initIdentity(stored.uniqueId || '', stored.certPem || '', stored.keyPem || ''));
+    }
+
+    if (idPayload && idPayload.uniqueId) {
+      try {
+        localStorage.setItem(STORAGE_IDENTITY, JSON.stringify(idPayload));
+      } catch {
+        // ignore
+      }
     }
 
     return { available: true, runtime: mod };
@@ -112,63 +157,90 @@ export async function detectWasmEngine() {
   }
 }
 
-export async function runWasmJobAsync(runtime, op, arg1 = '', arg2 = '') {
-  if (!runtime || typeof runtime.startAsyncJob !== 'function' || typeof runtime.pollAsyncJob !== 'function') {
-    throw new Error('WASM runtime requires pthread async job support (rebuild tizen/wasm)');
-  }
-  const jobId = runtime.startAsyncJob(op, String(arg1), String(arg2));
-  while (true) {
-    const raw = runtime.pollAsyncJob(jobId);
-    const parsed = JSON.parse(raw);
-    if (parsed.done) {
-      return parsed.payload;
-    }
-    await new Promise((r) => setTimeout(r, 20));
-  }
-}
-
 export async function probeHostAsync(runtime, address) {
-  return runWasmJobAsync(runtime, 'probe', address, '');
+  return runWasmJobAsync(runtime, 'probe', address, '', '', { timeoutMs: 12000 });
 }
 
-export async function pairHostAsync(runtime, address, pin) {
-  return runWasmJobAsync(runtime, 'pair', address, pin);
+export async function pairHostAsync(runtime, address, pin, { signal = null } = {}) {
+  return runWasmJobAsync(runtime, 'pair', address, pin, '', { timeoutMs: 130000, signal });
+}
+
+export async function cancelPairingAsync(runtime) {
+  if (!runtime || typeof runtime.startAsyncJob !== 'function') return;
+  await runWasmJobAsync(runtime, 'cancel_pair', '', '', '', { timeoutMs: 5000 });
 }
 
 export async function listAppsAsync(runtime, address) {
-  return runWasmJobAsync(runtime, 'applist', address, '');
+  return runWasmJobAsync(runtime, 'applist', address, '', '', { timeoutMs: 15000 });
+}
+
+export async function cancelHostAppAsync(runtime, address) {
+  return runWasmJobAsync(runtime, 'cancel_app', address, '', '', { timeoutMs: 10000 });
 }
 
 export class WasmStreamSession {
-  constructor(runtime, host, appId, settings) {
+  constructor(runtime, host, appId, settings, { resume = false } = {}) {
     this.runtime = runtime;
     this.host = host;
     this.appId = appId;
+    this.resume = resume;
     this.settings = settings;
     this.enabled = settings.fwEnabled !== false;
+    this.useVideoTexture = Boolean(
+      this.enabled && (host.frameWarpVersion || 0) >= 1 && !settings.hdr
+    );
     this._timer = null;
+    this._stopped = false;
   }
 
-  async start(onStats) {
+  async start(onStats, { onTerminated = null, onConnStatus = null } = {}) {
     const [w, h] = String(this.settings.resolution || '3840x2160').split('x').map(Number);
+    const width = w || 3840;
+    const height = h || 2160;
+
+    // Resize WebGL drawing buffer to match stream resolution in Frame Warp mode,
+    // or show the hardware <video> sink for direct scanout / HDR10.
+    const canvas = typeof document !== 'undefined' ? document.getElementById('stream-canvas') : null;
+    const video = typeof document !== 'undefined' ? document.getElementById('tizen-video-sink') : null;
+    if (canvas) {
+      if (this.useVideoTexture) {
+        canvas.width = width;
+        canvas.height = height;
+        canvas.style.display = 'block';
+      } else {
+        canvas.style.display = 'none';
+      }
+    }
+    if (video) {
+      video.className = this.useVideoTexture ? 'video-sink-hidden' : 'video-sink-direct';
+    }
+
     if (typeof this.runtime.prepareStreamMedia === 'function' && typeof this.runtime.startAsyncJob === 'function') {
       const prepOk = this.runtime.prepareStreamMedia(
         this.host.address,
         this.appId || 0,
-        false,
-        w || 3840,
-        h || 2160,
-        Number(this.settings.fps) || 120,
+        Boolean(this.resume),
+        width,
+        height,
+        Number(this.settings.fps) || 60,
         this.settings.codec || 'hevc',
         Number(this.settings.bitrate) || 100,
+        Boolean(this.settings.hdr),
+        Boolean(this.settings.surround51),
         this.enabled,
-        this.settings.fwLens !== false,
-        Number(this.settings.fwMaskWidth) || 1024
+        this.useVideoTexture
       );
       if (!prepOk) {
         throw new Error(this.runtime.lastError ? this.runtime.lastError() : 'Failed to initialize TV WebGL / video decoder');
       }
-      const conn = await runWasmJobAsync(this.runtime, 'connect_stream', this.host.address, String(this.appId || 0));
+      const conn = await runWasmJobAsync(
+        this.runtime,
+        'connect_stream',
+        this.host.address,
+        String(this.appId || 0),
+        '',
+        { timeoutMs: 30000 }
+      );
       if (!conn || !conn.ok) {
         throw new Error((conn && conn.error) || 'Failed to connect stream');
       }
@@ -180,11 +252,35 @@ export class WasmStreamSession {
     }
 
     this._timer = setInterval(() => {
+      if (this._stopped) return;
+      if (typeof this.runtime.pollSessionEvents === 'function') {
+        try {
+          const events = JSON.parse(this.runtime.pollSessionEvents());
+          for (const ev of events) {
+            if (ev.type === 'terminated') {
+              clearInterval(this._timer);
+              this._timer = null;
+              onTerminated?.(ev.code);
+              return;
+            }
+            if (ev.type === 'conn_status') {
+              onConnStatus?.(ev.code);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
       if (!onStats || !this.runtime.getFrameWarpStatus) return;
       try {
         const st = JSON.parse(this.runtime.getFrameWarpStatus());
         onStats({
-          session: `${this.host.name} (${this.settings.resolution}@${this.settings.fps} ${this.settings.codec.toUpperCase()})`,
+          session: `${this.host.name} (${this.settings.resolution}@${this.settings.fps} ${this.settings.codec.toUpperCase()}${st.hdrActive ? ' HDR' : ''})`,
+          rxFps: st.rxFps || 0,
+          decodedFps: st.decodedFps || 0,
+          renderedFps: st.renderedFps || 0,
+          directScanout: Boolean(st.directScanout),
           enabled: this.enabled && Boolean(st.negotiated),
           locked: Boolean(st.locked),
           pixels: [st.pxX || 0, st.pxY || 0],
@@ -210,10 +306,29 @@ export class WasmStreamSession {
     if (this.runtime.sendMouse) this.runtime.sendMouse(dx, dy);
   }
 
-  sendController(index, state) {
+  sendMouseButton(action, button) {
+    if (this.runtime.sendMouseButton) this.runtime.sendMouseButton(action, button);
+  }
+
+  sendMouseWheel(clicks) {
+    if (this.runtime.sendMouseWheel) this.runtime.sendMouseWheel(clicks);
+  }
+
+  sendKey(keyCode, action, modifiers) {
+    if (this.runtime.sendKey) this.runtime.sendKey(keyCode, action, modifiers);
+  }
+
+  sendControllerArrival(index, activeMask) {
+    if (this.runtime.sendControllerArrival) {
+      this.runtime.sendControllerArrival(index & 0xff, activeMask & 0xffff);
+    }
+  }
+
+  sendController(index, activeMask, state) {
     if (this.runtime.sendController) {
       this.runtime.sendController(
-        index,
+        index & 0xffff,
+        activeMask & 0xffff,
         state.buttons | 0,
         state.leftTrigger & 0xff,
         state.rightTrigger & 0xff,
@@ -225,15 +340,32 @@ export class WasmStreamSession {
     }
   }
 
-  stop() {
+  async stop() {
+    if (this._stopped) return;
+    this._stopped = true;
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
-    if (this.runtime.stopStream) this.runtime.stopStream();
+
+    if (typeof this.runtime.shutdownMedia === 'function') {
+      this.runtime.shutdownMedia();
+    }
+    if (typeof this.runtime.startAsyncJob === 'function' && typeof this.runtime.pollAsyncJob === 'function') {
+      try {
+        await runWasmJobAsync(this.runtime, 'stop_stream', '', '', '', { timeoutMs: 8000 });
+      } catch {
+        // ignore
+      }
+    } else if (typeof this.runtime.stopStream === 'function') {
+      this.runtime.stopStream();
+    }
+
+    const video = typeof document !== 'undefined' ? document.getElementById('tizen-video-sink') : null;
+    if (video) video.className = 'video-sink-hidden';
   }
 }
 
 /**
- * Interactive Rubylight Frame Warp v1 Simulator:
+ * Interactive Offline Frame Warp v1 Simulator:
  * Renders a 3D-like horizon + grid world at 60 fps with 45 ms simulated round-trip+game lag,
  * draws a static FPS HUD (crosshair, health bar, minimap), emits real binary 0x5544/0x5545/0x5546
  * packets, and feeds frames into `WarpRenderer` so Frame Warp can be visually verified on TV or desktop.
@@ -245,17 +377,15 @@ export class FrameWarpDemoSession {
     this.width = 1920;
     this.height = 1080;
 
-    // Offscreen 2D canvas acts as the "host-rendered video frame"
     this.hostCanvas = document.createElement('canvas');
     this.hostCanvas.width = this.width;
     this.hostCanvas.height = this.height;
     this.hostCtx = this.hostCanvas.getContext('2d');
 
-    this.frameWarp = new FrameWarp(0, Number(settings.fwMaskWidth) || 1024);
+    this.frameWarp = new FrameWarp(0, 1024);
     this.enabled = Boolean(settings.fwEnabled);
-    this.lensEnabled = Boolean(settings.fwLens);
+    this.lensEnabled = true;
 
-    // Simulated host state (45 ms round-trip + game lag)
     this.simLagMs = 45;
     this.frameNumber = 0;
     this.hostYaw = 0;
@@ -275,11 +405,8 @@ export class FrameWarpDemoSession {
   }
 
   _initProtocol() {
-    // 1. Client sends 0x5543 FrameWarpRequest
     this.frameWarp.request(this.enabled, this.lensEnabled);
-
-    // 2. Host replies with 0x5544 Model (52 bytes with 90° horizontal FOV focal length)
-    const focal = this.lensEnabled ? this.width / 2 : 0.0; // tan(45°) = 1.0 -> focal = width/2
+    const focal = this.width / 2;
     const modelBytes = encodeModel({
       generation: 1,
       mouseLocked: true,
@@ -297,15 +424,11 @@ export class FrameWarpDemoSession {
     });
     this.frameWarp.onModelBytes(modelBytes);
 
-    // 3. Host sends 0x5546 LEB128 RLE HUD Mask (240x135 grid covering crosshair, health bar, minimap)
     const mw = 240;
     const mh = 135;
     const mask = new HudMask(1, mw, mh);
-    // Center crosshair
     mask.fillRect(114, 62, 12, 11, true);
-    // Bottom-left health bar
     mask.fillRect(8, 112, 62, 15, true);
-    // Top-right minimap
     mask.fillRect(194, 8, 38, 34, true);
     const maskBytes = mask.encode();
     if (maskBytes) {
@@ -322,7 +445,6 @@ export class FrameWarpDemoSession {
   }
 
   sendMouse(dx, dy) {
-    // Wire-count immediately (just like nightjar-core InputQueue::emit)
     this.frameWarp.noteMouse(dx, dy);
     this.pendingMouse.push({
       deliverAt: performance.now() + this.simLagMs,
@@ -331,7 +453,7 @@ export class FrameWarpDemoSession {
     });
   }
 
-  sendController(index, state) {
+  sendController(index, _activeMask, state) {
     this.frameWarp.noteController(index, state.rightStickX, state.rightStickY);
     if (index === 0) {
       this.pendingStick.push({
@@ -356,7 +478,6 @@ export class FrameWarpDemoSession {
       this.hostCtrlSeq = ev.seq;
       this.currentHostStick = [ev.rx, ev.ry];
     }
-    // Apply stick turn at host
     const vx = this.currentHostStick[0] / 32767;
     const vy = this.currentHostStick[1] / 32767;
     const r = Math.hypot(vx, vy);
@@ -373,7 +494,6 @@ export class FrameWarpDemoSession {
     const w = this.width;
     const h = this.height;
 
-    // Sky + ground gradient shifted by host camera yaw/pitch
     const horizon = h * 0.5 - this.hostPitch;
     const sky = ctx.createLinearGradient(0, 0, 0, Math.max(1, horizon));
     sky.addColorStop(0, '#0b1628');
@@ -387,7 +507,6 @@ export class FrameWarpDemoSession {
     ctx.fillStyle = ground;
     ctx.fillRect(0, Math.max(0, horizon), w, h - Math.max(0, horizon));
 
-    // World vertical pillars & grid lines (clearly reveal camera shift + lens warp)
     const spacing = 160;
     const offsetX = ((-this.hostYaw) % spacing + spacing) % spacing;
     ctx.strokeStyle = 'rgba(232, 163, 61, 0.35)';
@@ -398,12 +517,10 @@ export class FrameWarpDemoSession {
       ctx.lineTo(x, h);
       ctx.stroke();
 
-      // Pillar marker on horizon
       ctx.fillStyle = 'rgba(232, 163, 61, 0.22)';
       ctx.fillRect(x - 18, horizon - 110, 36, 110);
     }
 
-    // Horizontal reference lines
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
     for (let y = horizon % 120; y < h; y += 120) {
       ctx.beginPath();
@@ -412,7 +529,6 @@ export class FrameWarpDemoSession {
       ctx.stroke();
     }
 
-    // Horizon line
     ctx.strokeStyle = '#e8a33d';
     ctx.lineWidth = 3;
     ctx.beginPath();
@@ -420,8 +536,6 @@ export class FrameWarpDemoSession {
     ctx.lineTo(w, horizon);
     ctx.stroke();
 
-    // --- Static HUD elements (protected by 0x5546 HUD Mask!) ---
-    // 1. Center crosshair
     ctx.strokeStyle = '#4cd98b';
     ctx.lineWidth = 3;
     ctx.beginPath();
@@ -431,7 +545,6 @@ export class FrameWarpDemoSession {
     ctx.moveTo(w / 2, h / 2 + 6);  ctx.lineTo(w / 2, h / 2 + 22);
     ctx.stroke();
 
-    // 2. Bottom-left health bar
     ctx.fillStyle = 'rgba(12, 14, 20, 0.85)';
     ctx.fillRect(72, 905, 480, 108);
     ctx.strokeStyle = '#e8a33d';
@@ -443,7 +556,6 @@ export class FrameWarpDemoSession {
     ctx.font = 'bold 24px sans-serif';
     ctx.fillText('HUD LOCKED — HP 84 / 100', 96, 942);
 
-    // 3. Top-right minimap
     ctx.fillStyle = 'rgba(12, 14, 20, 0.85)';
     ctx.fillRect(1560, 72, 288, 256);
     ctx.strokeStyle = '#e8a33d';
@@ -466,13 +578,11 @@ export class FrameWarpDemoSession {
       if (!this.running) return;
       const dtMs = now - this.lastHostFrameMs;
 
-      // Host produces 60 fps frames (every 16.67 ms); TV displays at 60/120 Hz with inter-frame redraws!
       if (dtMs >= 16.6) {
         this._stepHost(now, dtMs / 1000);
         this.lastHostFrameMs = now;
         this.frameNumber++;
 
-        // Emit real binary 0x5545 Tags (carrying newest + up to 3 previous frames)
         const tag = {
           frame: this.frameNumber,
           mouseX: this.hostMouseX,
@@ -493,14 +603,17 @@ export class FrameWarpDemoSession {
         const warp = this.enabled ? this.frameWarp.warp(this.frameNumber) : null;
         this.renderer.draw(warp, this.frameNumber, this.frameWarp.inputSeq);
       } else if (this.enabled) {
-        // Inter-frame redraw between host frames!
         this.renderer.maybeRedrawBetweenFrames(this.frameWarp);
       }
 
       if (onStats) {
         const st = this.frameWarp.status();
         onStats({
-          session: `Frame Warp Lab (60 fps host · ${this.simLagMs} ms lag)`,
+          session: `Frame Warp Lab (60 fps · ${this.simLagMs} ms lag)`,
+          rxFps: 60,
+          decodedFps: 60,
+          renderedFps: 120,
+          directScanout: false,
           enabled: this.enabled,
           locked: Boolean(st.model && (st.model.mouseLocked || st.model.stickLocked)),
           pixels: st.pixels,
@@ -519,7 +632,7 @@ export class FrameWarpDemoSession {
     this._raf = requestAnimationFrame(tick);
   }
 
-  stop() {
+  async stop() {
     this.running = false;
     if (this._raf) cancelAnimationFrame(this._raf);
   }

@@ -79,6 +79,17 @@ A stream runs on the Rust engine, `nightjar-core` behind [`RustBridge`](../app/s
 
 Native code beside the engines, in `app/src/main/jni/`: `pyrowave-renderer/`, `vulkan/`, `evdev_reader/`, `window-dataspace/`.
 
+## The Tizen TV app
+
+`tizen/` builds a Samsung Tizen OS 10 `.wgt` web app paired with a C++17 WebAssembly engine compiled via Samsung's Emscripten 1.39.4.7 SDK (`tizen/Dockerfile`).
+
+| Part | Where (`tizen/`) |
+| --- | --- |
+| TV UI, i18n, input | `app/index.html`, `app/css/nightjar-tv.css`, `app/js/app.js`, `app/js/i18n.js`, `app/js/input-manager.js`, `app/js/gamepad-mapping.js` |
+| WASM bridge & offline lab | `app/js/wasm-bridge.js`, `app/js/frame-warp.js`, `app/js/warp-renderer.js` |
+| C++17 WASM engine | `wasm/src/main.cpp` (`WorkerQueue`), `host_http_client.{hpp,cpp}`, `codec_capabilities.{hpp,cpp}`, `nightjar_session.{hpp,cpp}`, `tizen_video_decoder.{hpp,cpp}` (`TextureRing`), `tizen_audio_decoder.{hpp,cpp}`, `warp_gl_renderer.{hpp,cpp}`, `frame_warp_{protocol,predictor}.{hpp,cpp}` |
+| Build & packaging | `Dockerfile`, `wasm/CMakeLists.txt`, `wasm/scripts/patch_moonlight_frame_warp.py`, `build-wgt.ps1`, `.github/workflows/tizen.yml` |
+
 ## Checklists
 
 ### A setting
@@ -120,6 +131,7 @@ Add it to [`Feature`](../protocol/policy/src/http/capabilities.rs) with the evid
 | A policy | Its module tests, and recorded traces under `protocol/policy/tests/traces/` replayed by `protocol/policy/tests/traces.rs` |
 | Desktop UI | `protocol/desktop-ui/src/ui/tests.rs` draws pages and dialogs without a window; `protocol/desktop-ui/src/shot.rs` rasterises them for screenshots. |
 | Android | `gradlew :app:testNonRootDebugUnitTest --tests <class>` (JUnit and Robolectric, under `app/src/test/java/`). The unit tests do not compile the JNI code: `gradlew :app:externalNativeBuildNonRootDebug` does. `scripts/test-native.sh` runs the native C tests, `scripts/emulator-smoke.py` drives the app on an emulator. |
+| Tizen TV | `node --test tizen/tests/frame-warp.test.mjs tizen/tests/tv-runtime-and-input.test.mjs`, and `cmake --build tizen/wasm/build --config Release` + `ctest --test-dir tizen/wasm/build -C Release --output-on-failure`. |
 | Documentation | `node scripts/check-doc-links.mjs`, and `scripts/generate-settings.py` leaving `docs/settings.md` unchanged |
 
 [Building](building.md) has the toolchains each of these needs.

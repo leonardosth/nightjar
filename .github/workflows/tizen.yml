@@ -24,9 +24,14 @@ jobs:
       - name: Run JS Frame Warp v1, WASM runtime & TV input tests
         run: node --test tizen/tests/frame-warp.test.mjs tizen/tests/tv-runtime-and-input.test.mjs
 
-      - name: Build & run C++17 Frame Warp unit tests
+      - name: Check documentation links
+        run: node scripts/check-doc-links.mjs
+
+      - name: Build & run C++17 Frame Warp unit tests (ASan + UBSan)
         run: |
-          cmake -S tizen/wasm -B tizen/wasm/build -DCMAKE_BUILD_TYPE=Release
+          cmake -S tizen/wasm -B tizen/wasm/build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
           cmake --build tizen/wasm/build
           ctest --test-dir tizen/wasm/build --output-on-failure
 

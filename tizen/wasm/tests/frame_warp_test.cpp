@@ -173,6 +173,26 @@ int main() {
         assert(tr.current_display_texture() == 22u);
     }
 
+    // 13. Golden malformed 0x5546 HUD mask RLE rejection (network fuzz edge cases)
+    {
+        // Truncated varint
+        const uint8_t trunc_varint[] = {1, 1, 1, 0, 8, 0, 1, 0, 0x80};
+        assert(!Mask::decode(trunc_varint, sizeof(trunc_varint)).has_value());
+        // Zero middle run (forbidden except first run of a row)
+        const uint8_t zero_mid[] = {1, 1, 1, 0, 8, 0, 1, 0, 4, 0, 4};
+        assert(!Mask::decode(zero_mid, sizeof(zero_mid)).has_value());
+        // Row sum exceeds width
+        const uint8_t over_row[] = {1, 1, 1, 0, 8, 0, 1, 0, 9};
+        assert(!Mask::decode(over_row, sizeof(over_row)).has_value());
+        // Width > 2048
+        const uint8_t wide_mask[] = {1, 1, 1, 0, 0x01, 0x08, 1, 0, 1};
+        assert(!Mask::decode(wide_mask, sizeof(wide_mask)).has_value());
+        // Payload > 48 KiB
+        std::vector<uint8_t> huge(49153, 0);
+        huge[0] = 1; huge[1] = 1; huge[4] = 8; huge[6] = 1;
+        assert(!Mask::decode(huge.data(), huge.size()).has_value());
+    }
+
     std::cout << "All C++ Frame Warp & HostHttpClient tests passed!\n";
     return 0;
 }

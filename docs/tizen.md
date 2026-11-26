@@ -1,108 +1,56 @@
-# Nightjar for Samsung Tizen OS 10 TV (with Frame Warp)
+# Nightjar for Samsung Tizen OS 10 TV
 
-[Nightjar docs](index.md) · [Frame Warp Protocol](protocol/frame-warp.md)
+[Nightjar docs](index.md) · [Code map](code-map.md) · [Frame Warp Protocol](protocol/frame-warp.md)
 
-This fork adapts **Nightjar** (the host-neutral Moonlight-protocol client paired with **Rubylight**) to run natively on **Samsung Smart TVs running Tizen OS 10** (Chromium M130), with first-class support for **Frame Warp v1**.
-
----
-
-## Como funciona o Frame Warp na TV Samsung (Tizen OS 10)
-
-O **Frame Warp** reduz drasticamente a latência percebida de câmera (mouse ou analógico direito do controle) deslocando o quadro de vídeo na GPU da TV a cada atualização da tela (60/120/144 Hz), enquanto mantém o HUD do jogo (mira, barra de vida, minimapa) 100% fixo usando a máscara enviada pelo Rubylight.
-
-Para fazer isso no Tizen OS 10 sem copiar quadros de volta para a CPU, esta arquitetura combina:
-
-1. **Tizen Sockets Extension (`tizen/wasm/`)**: permite conexões diretas TCP/UDP (HTTP/mTLS, RTSP `a=x-rl-control`, ENet criptografado `SS_ENC_CONTROL_V2` e RTP vídeo/áudio) direto da TV para o PC com Rubylight, sem servidor proxy.
-2. **Tizen WASM Player em modo `RenderingMode::kVideoTexture`**:
-   ```cpp
-   samsung::wasm::ElementaryMediaStreamSource(
-       LatencyMode::kUltraLow,
-       RenderingMode::kVideoTexture
-   );
-   ```
-   O decodificador de vídeo por hardware da TV (HEVC / AV1 / H.264) escreve cada frame diretamente em uma textura WebGL 2.0 / GLES 3.0 (`FillTextureWithNextFrameSync`).
-3. **Shader WebGL 2.0 / GLES 3.00 es (`tizen/app/shaders/warp.frag` & `tizen/wasm/src/warp_gl_renderer.cpp`)**:
-   - Porta fielmente o shader do Nightjar (`app/src/main/assets/shaders/warp.frag` e `protocol/desktop-media/src/frame_warp.hlsl`).
-   - Aplica a projeção de **lente em perspectiva** (`Model::focal`) para que as bordas da imagem girem corretamente em FOVs amplos.
-   - Faz **verificação dupla da máscara de HUD (`GL_R8`)** tanto na posição de destino quanto na posição de origem deslocada, evitando deslocamento e "fantasma" (duplicação) do HUD.
-   - Preenche as bordas reveladas com **espelhamento + escurecimento progressivo de 35% nos primeiros 8%**.
-   - Faz **redesenho inter-frame** a cada `requestAnimationFrame` (120 Hz / 144 Hz) sempre que o movimento de câmera mudar `>= 0.25 px` entre quadros recebidos.
-4. **Protocolo Frame Warp v1 completo (`0x5543..0x5546`)**:
-   - `tizen/wasm/src/frame_warp_protocol.{hpp,cpp}` + `frame_warp_predictor.{hpp,cpp}` (C++17)
-   - `tizen/app/js/frame-warp.js` (ES Module idêntico, testado via Node.js e usado no **Frame Warp Lab** interativo)
+Nightjar's Tizen TV port runs on **Samsung Smart TVs with Tizen OS 10** (Chromium M130, `required_version="6.0"`) for 4K 60/120 fps low-latency streaming (100–150 Mbps) with capability-gated **Frame Warp v1** (`0x5543..0x5546`).
 
 ---
 
-## Estrutura do Port (`tizen/`)
+## Architecture
 
-```text
-tizen/
-├── app/                      # Pacote Tizen Web App (.wgt)
-│   ├── config.xml            # Manifesto tv-samsung (privilégios internet, tv.inputdevice)
-│   ├── index.html            # Interface TV 10-foot (controle remoto + gamepad)
-│   ├── css/nightjar-tv.css   # Tema escuro glassmorphic inspirado no Nightjar
-│   ├── shaders/
-│   │   ├── warp.vert         # Vertex shader WebGL 2.0 / GLES 3.00 es
-│   │   └── warp.frag         # Fragment shader Frame Warp v1 (lente + HUD mask + edge fill)
-│   └── js/
-│       ├── frame-warp.js     # Codecs 0x5543..0x5546 + Predictor + FrameRing
-│       ├── warp-renderer.js  # Renderer WebGL 2.0 + inter-frame redraws
-│       ├── input-manager.js  # Controle remoto Tizen + Gamepad API + Mouse Pointer Lock
-│       ├── wasm-bridge.js    # Ponte WASM + Simulador Rubylight (Frame Warp Lab)
-│       └── app.js            # Controlador da aplicação TV
-├── wasm/                     # Motor C++17 (Samsung Emscripten SDK)
-│   ├── CMakeLists.txt
-│   ├── src/
-│   │   ├── frame_warp_protocol.{hpp,cpp}
-│   │   ├── frame_warp_predictor.{hpp,cpp}
-│   │   ├── tizen_video_decoder.{hpp,cpp}
-│   │   ├── warp_gl_renderer.{hpp,cpp}
-│   │   ├── nightjar_session.{hpp,cpp}
-│   │   └── main.cpp
-│   └── tests/frame_warp_test.cpp
-├── tests/frame-warp.test.mjs # Testes unitários completos (node --test)
-├── Dockerfile                # Build reprodutível do .wasm com Samsung Emscripten SDK
-└── build-wgt.ps1             # Empacotamento, assinatura (.wgt) e deploy via sdb
-```
+1. **Single-worker C++17 WASM engine (`tizen/wasm/`)**:
+   - Built with Samsung's Emscripten 1.39.4.7 SDK (`TIZEN_WASM_SDK`, Tizen Sockets Extension, OpenSSL/libcurl) and pinned `moonlight-common-c` + `libopus` 1.5.2.
+   - All network, mTLS pairing (with X.509 certificate pinning), RTSP, ENet control, and RSA-2048 identity generation run on a single persistent `WorkerQueue` pthread — never blocking the browser main thread.
+2. **Dual hardware video pipeline (`TizenVideoDecoder` + `WarpGlRenderer`)**:
+   - Uses `samsung::wasm::ElementaryMediaStreamSource` in `LatencyMode::kUltraLow`.
+   - **Frame Warp path (`RenderingMode::kVideoTexture`)**: decodes HEVC (up to Level 5.2 `hev1.1.6.L156.B0` for 4K120), AV1 (`av01.0.13M.08`), or H.264 directly into a **3-slot `GL_TEXTURE_EXTERNAL_OES` `TextureRing`** so the displayed frame stays valid across 120 Hz inter-frame redraws until replaced. Monotonic PTS values are matched back to exact RTP `frameNumber`s via `HTMLMediaElement::GetCurrentTime()` + `FrameRing::lookup_nearest`.
+   - **Direct scanout / HDR10 path (`RenderingMode::kMediaElement`)**: when Frame Warp is off, not offered by the host, or HDR10 (10-bit Main10) is enabled, frames go straight to the hardware `<video id="tizen-video-sink">` plane with zero shader pass and native HDR10 metadata passthrough.
+3. **Low-latency Opus audio (`TizenAudioDecoder`)**:
+   - Decodes stereo or 5.1 multistream Opus via `libopus` into `SampleFormat::kS16` PCM packets fed into a second `ElementaryMediaTrack` on the same `ElementaryMediaStreamSource`.
+4. **10-foot TV UI (`tizen/app/`)**:
+   - Localized in English (`en`) and Brazilian Portuguese (`pt-BR`), 2D spatial D-pad/gamepad focus, W3C-to-Moonlight gamepad flag mapping with active controller bitmask and idle deduplication, app library picker (launch, resume, quit), concurrent PIN pairing with cancellation, and Tizen screensaver suppression (`webapis.appcommon.setScreenSaver`).
 
 ---
 
-## Como compilar e instalar na sua TV Samsung (Tizen OS 10)
+## Building and Installing on Samsung S85F (Tizen OS 10)
 
-### 1. Empacotar e assinar o `.wgt` (Windows com Tizen Studio CLI)
-
-```powershell
-# Compila o pacote assinado em tizen/dist/Nightjar.wgt e roda todos os testes do Frame Warp:
-.\tizen\build-wgt.ps1 -Profile leonardosth2
-```
-
-### 2. (Para streaming direto via Tizen Sockets + Hardware Decoder) Compilar o `.wasm`
-
-O módulo C++ em `tizen/wasm/` usa o **Samsung Emscripten SDK** (`Tizen WASM Player` + `Tizen Sockets Extension`). Com Docker instalado (ou via GitHub Actions em `.github/workflows/tizen.yml`):
+### 1. Build the WASM engine (Docker)
 
 ```powershell
 mkdir tizen\app\wasm -Force
 docker build -f tizen/Dockerfile -t nightjar-tizen-wasm .
 docker run --rm -v "${PWD}\tizen\app\wasm:/out" nightjar-tizen-wasm
-# Em seguida, gere o .wgt novamente para incluir tizen/app/wasm/:
-.\tizen\build-wgt.ps1 -Profile leonardosth2
 ```
 
-### 3. Instalar na TV Samsung via Modo Desenvolvedor (`sdb`)
+### 2. Package, sign, and deploy `.wgt` via `sdb`
 
-1. Na TV Samsung, abra **Apps** e digite **`12345`** no controle remoto.
-2. Ative o **Developer Mode**, informe o IP do seu PC e reinicie a TV.
-3. Conecte e instale direto pelo script:
-   ```powershell
-   .\tizen\build-wgt.ps1 -Profile leonardosth2 -TvIp <IP_DA_SUA_TV>
-   ```
-   Ou manualmente:
-   ```powershell
-   sdb connect <IP_DA_SUA_TV>:26101
-   tizen install -n Nightjar.wgt -t <IP_DA_SUA_TV>:26101 -- tizen\dist
-   ```
+Enable Developer Mode on the TV (**Apps → `12345` → Developer Mode ON → enter PC IP → reboot TV**), then run:
 
-### 4. Testando o Frame Warp na TV ou no PC
+```powershell
+.\tizen\build-wgt.ps1 -Profile <YOUR_TIZEN_PROFILE> -TvIp <TV_IP>
+```
 
-- **Frame Warp Lab (embutido no app):** clique em **Launch Frame Warp Live Test** na tela inicial. Ele simula um host Rubylight com 45 ms de latência emitindo pacotes binários reais `0x5544` (Model com lente FOV 90°), `0x5545` (Tags) e `0x5546` (HUD Mask RLE), permitindo mover o analógico direito do controle ou o mouse e verificar visualmente a compensação instantânea com o HUD travado.
-- **Com Rubylight real:** no PC com Rubylight, certifique-se de que o Frame Warp está habilitado (o host anuncia `<FrameWarpVersion>1</FrameWarpVersion>` em `/serverinfo` e `0x5543..0x5546` em `a=x-rl-control`). No app Nightjar da TV, mantenha **Settings → Frame Warp → Enable Frame Warp** e **Perspective Lens Warping** ativados.
+---
+
+## 4K 60/120 fps Validation Checklist (S85F)
+
+1. Enable **Performance Overlay** in **Settings**.
+2. Start a 4K 60 fps @ 100 Mbps HEVC stream and verify `FPS (Rx/Dec/Ren)` shows `60 / 60 / 120` during camera motion with `Frame Warp: LOCKED (Active)` and `untagged` staying near `0`.
+3. Raise to 4K 120 fps @ 100–150 Mbps (HEVC and AV1) and confirm `Dec` keeps up with `Rx`. If `Dec` falls behind `Rx` in `kVideoTexture` mode at 4K120, test 4K60 + Frame Warp (120 Hz inter-frame redraws) vs 4K120 direct scanout (`Frame Warp: OFF`).
+
+---
+
+## Troubleshooting
+
+- **Install error `[118]`**: Regenerate your Samsung Distributor Certificate tied to the TV's DUID in Tizen Studio Certificate Manager, then re-run `build-wgt.ps1`.
+- **Pairing rejected or hangs**: Ensure no other pairing dialog is open on the host; click **Cancel** on the TV to send `/unpair` and retry.

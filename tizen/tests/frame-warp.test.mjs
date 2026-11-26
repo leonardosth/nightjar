@@ -231,3 +231,13 @@ test('FrameWarp high-level wrapper tracks mask generations and input_seq', () =>
   fw.noteMouse(10, -5);
   assert.equal(fw.inputSeq, 1);
 });
+
+test('HudMask.decode safely rejects malformed 0x5546 RLE payloads', () => {
+  assert.equal(HudMask.decode(new Uint8Array([1, 1, 1, 0, 8, 0, 1, 0, 0x80])), null);
+  assert.equal(HudMask.decode(new Uint8Array([1, 1, 1, 0, 8, 0, 1, 0, 4, 0, 4])), null);
+  assert.equal(HudMask.decode(new Uint8Array([1, 1, 1, 0, 8, 0, 1, 0, 9])), null);
+  assert.equal(HudMask.decode(new Uint8Array([1, 1, 1, 0, 0x01, 0x08, 1, 0, 1])), null);
+  const huge = new Uint8Array(49153);
+  huge[0] = 1; huge[1] = 1; huge[4] = 8; huge[6] = 1;
+  assert.equal(HudMask.decode(huge), null);
+});

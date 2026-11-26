@@ -15,6 +15,13 @@ import {
   shouldSendGamepadState,
   pickSpatialFocus,
 } from '../app/js/gamepad-mapping.js';
+import {
+  STRINGS,
+  resolveLocale,
+  tr,
+  migrateSettings,
+  RETIRED_SETTING_KEYS,
+} from '../app/js/i18n.js';
 
 test('detectWasmEngine does not enter infinite microtask loop with Samsung Emscripten 1.39.4.7 Module.then', async () => {
   let thenCalls = 0;
@@ -284,6 +291,37 @@ test('pickSpatialFocus moves across 2D grid rows and columns instead of linear w
   assert.equal(pickSpatialFocus(rects, 0, 'right'), 1);
   assert.equal(pickSpatialFocus(rects, 3, 'up'), 1);
   assert.equal(pickSpatialFocus(rects, 3, 'left'), 2);
+});
+
+test('i18n tables have identical keys in en and pt-BR, no host brand names, and two-sentence help texts', () => {
+  const enKeys = Object.keys(STRINGS.en).sort();
+  const ptKeys = Object.keys(STRINGS['pt-BR']).sort();
+  assert.deepEqual(enKeys, ptKeys);
+
+  for (const lang of ['en', 'pt-BR']) {
+    for (const [k, v] of Object.entries(STRINGS[lang])) {
+      assert.equal(/rubylight|sunshine|apollo|gamestream/i.test(v), false, `Brand found in ${lang}.${k}: ${v}`);
+      if (k.startsWith('help.')) {
+        const sentences = v.trim().split(/[.!?]+/).filter((s) => s.trim().length > 0);
+        assert.equal(sentences.length, 2, `${lang}.${k} must have exactly 2 short sentences: "${v}"`);
+      }
+    }
+  }
+  assert.equal(resolveLocale('pt-BR'), 'pt-BR');
+  assert.equal(resolveLocale('pt-PT'), 'pt-BR');
+  assert.equal(resolveLocale('en-US'), 'en');
+  assert.equal(tr('en', 'app.title'), 'Nightjar');
+});
+
+test('migrateSettings clears retired fwLens and fwMaskWidth keys and applies safe measured defaults', () => {
+  const migrated = migrateSettings({ fps: '120', fwLens: false, fwMaskWidth: '512', bitrate: '150' });
+  for (const retired of RETIRED_SETTING_KEYS) {
+    assert.equal(retired in migrated, false, `Retired key ${retired} must be cleared`);
+  }
+  assert.equal(migrated.fps, '120');
+  assert.equal(migrated.bitrate, '150');
+  assert.equal(migrated.hdr, false);
+  assert.equal(migrated.surround51, false);
 });
 
 

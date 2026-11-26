@@ -3,8 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=1920, height=1080, initial-scale=1.0" />
-  <title>Nightjar — Tizen TV</title>
+  <title>Nightjar</title>
   <link rel="stylesheet" href="css/nightjar-tv.css" />
+  <script type="text/javascript" src="$WEBAPIS/webapis/webapis.js"></script>
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -14,18 +15,18 @@
         <div class="brand">
           <div class="brand-mark">NJ</div>
           <div>
-            <h1>Nightjar</h1>
-            <span class="subtitle">Samsung Tizen OS 10 · Frame Warp v1</span>
+            <h1 data-i18n="app.title">Nightjar</h1>
+            <span class="subtitle" data-i18n="app.subtitle">TV Streaming Client</span>
           </div>
         </div>
         <nav class="top-nav" role="tablist">
-          <button class="nav-tab focusable active" data-tab="hosts" tabindex="0">PCs &amp; Hosts</button>
-          <button class="nav-tab focusable" data-tab="settings" tabindex="0">Settings</button>
-          <button class="nav-tab focusable" data-tab="framewarp" tabindex="0">Frame Warp Lab</button>
+          <button class="nav-tab focusable active" data-tab="hosts" data-i18n="tab.hosts" tabindex="0">PCs</button>
+          <button class="nav-tab focusable" data-tab="settings" data-i18n="tab.settings" tabindex="0">Settings</button>
+          <button class="nav-tab focusable" data-tab="framewarp" data-i18n="tab.lab" tabindex="0">Frame Warp Lab</button>
         </nav>
         <div class="status-pills">
-          <span id="wasm-status-pill" class="pill pill-warn">WASM: Checking…</span>
-          <span id="gamepad-status-pill" class="pill">Gamepad: None</span>
+          <span id="wasm-status-pill" class="pill pill-warn" data-i18n="pill.wasmChecking">Engine: Checking…</span>
+          <span id="gamepad-status-pill" class="pill" data-i18n="pill.padNone">Gamepad: None</span>
         </div>
       </header>
 
@@ -33,24 +34,21 @@
       <main id="tab-hosts" class="tab-panel active">
         <section class="hero-card">
           <div>
-            <span class="badge">Rubylight · Sunshine · Apollo</span>
-            <h2>Stream your PC with zero-latency camera turns</h2>
-            <p>
-              Uses Samsung Tizen WASM Player (<code>RenderingMode::kVideoTexture</code>) and
-              WebGL 2.0 shaders to run Nightjar&apos;s Frame Warp v1 directly on your TV&apos;s GPU,
-              keeping game HUD elements locked in place while camera turns appear on the very next refresh.
+            <h2 data-i18n="hero.title">Low-latency PC streaming for your TV</h2>
+            <p data-i18n="hero.body">
+              Hardware-decoded 4K video with optional Frame Warp camera prediction on supported hosts.
             </p>
           </div>
           <div class="hero-actions">
-            <button id="btn-add-host" class="btn btn-primary focusable" tabindex="0">+ Add PC</button>
-            <button id="btn-launch-demo" class="btn btn-secondary focusable" tabindex="0">Launch Frame Warp Live Test</button>
+            <button id="btn-add-host" class="btn btn-primary focusable" data-i18n="btn.addPc" tabindex="0">+ Add PC</button>
+            <button id="btn-launch-demo" class="btn btn-secondary focusable" data-i18n="btn.openLab" tabindex="0">Open Frame Warp Lab</button>
           </div>
         </section>
 
         <section class="section-block">
           <div class="section-header">
-            <h3>Paired &amp; Saved PCs</h3>
-            <span class="hint">Use TV Remote D-Pad or Gamepad to select</span>
+            <h3 data-i18n="hosts.heading">Saved PCs</h3>
+            <span class="hint" data-i18n="hosts.hint">Use TV Remote or Gamepad to select, Red key to remove</span>
           </div>
           <div id="hosts-grid" class="cards-grid"></div>
         </section>
@@ -60,11 +58,11 @@
       <main id="tab-settings" class="tab-panel">
         <section class="settings-grid">
           <div class="settings-card">
-            <h3>Video &amp; Decoding</h3>
+            <h3 data-i18n="settings.videoHeading">Video &amp; Audio</h3>
             <label class="setting-row focusable" tabindex="0">
               <div>
-                <strong>Resolution</strong>
-                <span>Target stream resolution negotiated with the host.</span>
+                <strong data-i18n="setting.resolution">Resolution</strong>
+                <span data-i18n="help.resolution"></span>
               </div>
               <select id="set-resolution">
                 <option value="1920x1080">1080p (1920×1080)</option>
@@ -74,73 +72,69 @@
             </label>
             <label class="setting-row focusable" tabindex="0">
               <div>
-                <strong>Frame Rate</strong>
-                <span>Higher refresh rates pair with Frame Warp inter-frame redraws.</span>
+                <strong data-i18n="setting.fps">Frame Rate</strong>
+                <span data-i18n="help.fps"></span>
               </div>
               <select id="set-fps">
-                <option value="60">60 fps</option>
-                <option value="120" selected>120 fps</option>
+                <option value="60" selected>60 fps</option>
+                <option value="120">120 fps</option>
               </select>
             </label>
             <label class="setting-row focusable" tabindex="0">
               <div>
-                <strong>Video Codec</strong>
-                <span>Hardware decoded via Tizen WASM Player into a WebGL texture.</span>
+                <strong data-i18n="setting.codec">Video Codec</strong>
+                <span data-i18n="help.codec"></span>
               </div>
               <select id="set-codec">
                 <option value="hevc" selected>HEVC (H.265)</option>
-                <option value="av1">AV1 (Tizen 8–10)</option>
+                <option value="av1">AV1</option>
                 <option value="h264">H.264 (AVC)</option>
               </select>
             </label>
             <label class="setting-row focusable" tabindex="0">
               <div>
-                <strong>Bitrate (Mbps)</strong>
-                <span>Target video bitrate for local LAN streaming.</span>
+                <strong data-i18n="setting.bitrate">Bitrate</strong>
+                <span data-i18n="help.bitrate"></span>
               </div>
               <select id="set-bitrate">
                 <option value="30">30 Mbps</option>
                 <option value="60">60 Mbps</option>
                 <option value="100" selected>100 Mbps</option>
+                <option value="120">120 Mbps</option>
                 <option value="150">150 Mbps</option>
               </select>
+            </label>
+            <label class="setting-row focusable" tabindex="0">
+              <div>
+                <strong data-i18n="setting.hdr">HDR10 (10-bit)</strong>
+                <span data-i18n="help.hdr"></span>
+              </div>
+              <input id="set-hdr" type="checkbox" />
+            </label>
+            <label class="setting-row focusable" tabindex="0">
+              <div>
+                <strong data-i18n="setting.surround51">5.1 Surround Audio</strong>
+                <span data-i18n="help.surround51"></span>
+              </div>
+              <input id="set-surround51" type="checkbox" />
             </label>
           </div>
 
           <div class="settings-card highlight-card">
-            <h3>Frame Warp (Rubylight v1)</h3>
+            <h3 data-i18n="settings.fwHeading">Frame Warp &amp; Diagnostics</h3>
             <label class="setting-row focusable" tabindex="0">
               <div>
-                <strong>Enable Frame Warp</strong>
-                <span>Shows mouse or right-stick camera turns on the next TV refresh while locking the HUD.</span>
+                <strong data-i18n="setting.fwEnabled">Frame Warp</strong>
+                <span data-i18n="help.fwEnabled"></span>
               </div>
               <input id="set-fw-enabled" type="checkbox" checked />
             </label>
             <label class="setting-row focusable" tabindex="0">
               <div>
-                <strong>Perspective Lens Warping</strong>
-                <span>Requests camera focal length from host for accurate perspective turns at wide FOVs.</span>
+                <strong data-i18n="setting.overlay">Performance Overlay</strong>
+                <span data-i18n="help.overlay"></span>
               </div>
-              <input id="set-fw-lens" type="checkbox" checked />
-            </label>
-            <label class="setting-row focusable" tabindex="0">
-              <div>
-                <strong>HUD Mask Max Width</strong>
-                <span>Higher resolution keeps crosshairs and minimaps crisp; 1024 matches Nightjar Android.</span>
-              </div>
-              <select id="set-fw-mask-width">
-                <option value="0">Disabled (0)</option>
-                <option value="512">512 cells</option>
-                <option value="1024" selected>1024 cells (Recommended)</option>
-                <option value="2048">2048 cells (4K)</option>
-              </select>
-            </label>
-            <label class="setting-row focusable" tabindex="0">
-              <div>
-                <strong>Performance &amp; Frame Warp Overlay</strong>
-                <span>Shows lock state, shift in pixels, lens FOV, and warped/extrapolated frame counts.</span>
-              </div>
-              <input id="set-overlay" type="checkbox" checked />
+              <input id="set-overlay" type="checkbox" />
             </label>
           </div>
         </section>
@@ -150,60 +144,60 @@
       <main id="tab-framewarp" class="tab-panel">
         <section class="hero-card">
           <div>
-            <span class="badge">WebGL 2.0 · GLSL 300 es · Protocol 0x5543–0x5546</span>
-            <h2>Interactive Frame Warp Verification Lab</h2>
+            <span class="badge">Protocol 0x5543–0x5546 · Offline Simulator</span>
+            <h2 data-i18n="tab.lab">Frame Warp Lab</h2>
             <p>
-              Runs a simulated Rubylight host with realistic network + game latency (45 ms) that emits
-              real binary <code>0x5544</code> Model, <code>0x5545</code> Tags, and <code>0x5546</code>
-              LEB128 RLE HUD Mask messages through Nightjar&apos;s Frame Warp predictor and WebGL 2.0 shader.
-              Move your gamepad right stick or mouse to see instant camera response with locked HUD elements.
+              Runs a local simulated host with 45 ms latency emitting real binary
+              <code>0x5544</code> Model, <code>0x5545</code> Tags, and <code>0x5546</code>
+              HUD Mask packets so you can verify camera shift and HUD locking without a PC.
             </p>
           </div>
           <div class="hero-actions">
-            <button id="btn-lab-start" class="btn btn-primary focusable" tabindex="0">Start Live Test Scene</button>
-          </div>
-        </section>
-        <section class="info-grid">
-          <div class="info-tile">
-            <h4>Zero-Copy Video Texture</h4>
-            <p>On Tizen 10, <code>ElementaryMediaStreamSource</code> with <code>LatencyMode::kUltraLow</code> and <code>RenderingMode::kVideoTexture</code> feeds hardware-decoded frames directly into WebGL 2.0.</p>
-          </div>
-          <div class="info-tile">
-            <h4>Dual HUD Mask Check</h4>
-            <p>Samples <code>uHudMask</code> at both screen position and shifted source position so crosshairs, health bars, and minimaps never shift and never ghost.</p>
-          </div>
-          <div class="info-tile">
-            <h4>120 Hz Inter-Frame Redraws</h4>
-            <p>Between incoming video frames, the renderer re-warps the held texture on every TV refresh whenever input shifts the camera by &ge; 0.25 px.</p>
+            <button id="btn-lab-start" class="btn btn-primary focusable" data-i18n="btn.openLab" tabindex="0">Open Frame Warp Lab</button>
           </div>
         </section>
       </main>
 
       <footer class="bottom-bar">
-        <span><strong>D-Pad / Stick</strong> Navigate</span>
-        <span><strong>Enter / A</strong> Select</span>
-        <span><strong>Back / B</strong> Return</span>
-        <span><strong>Menu / LB+RB+Start</strong> Stream Menu</span>
+        <span><strong>D-Pad / Stick</strong> <span data-i18n="footer.nav">Navigate</span></span>
+        <span><strong>Enter / A</strong> <span data-i18n="footer.select">Select</span></span>
+        <span><strong>Back / B</strong> <span data-i18n="footer.back">Return</span></span>
+        <span><strong>Menu / LB+RB+Start+Back</strong> <span data-i18n="footer.menu">Stream Menu</span></span>
       </footer>
     </div>
 
     <!-- Add Host Modal -->
     <div id="add-host-modal" class="modal hidden" role="dialog" aria-modal="true">
       <div class="modal-card">
-        <h3>Add PC (Rubylight / Sunshine)</h3>
-        <p>Enter your PC&apos;s local IP address or hostname. Nightjar will check <code>/serverinfo</code> for <code>&lt;FrameWarpVersion&gt;</code>.</p>
+        <h3 data-i18n="modal.addTitle">Add PC</h3>
+        <p data-i18n="modal.addDesc">Enter your PC local IP address or hostname.</p>
         <label class="field">
-          <span>PC Name</span>
+          <span data-i18n="modal.pcName">PC Name</span>
           <input id="input-host-name" type="text" placeholder="Living-room PC" class="focusable" />
         </label>
         <label class="field">
-          <span>IP Address / Hostname</span>
+          <span data-i18n="modal.pcIp">IP Address / Hostname</span>
           <input id="input-host-ip" type="text" placeholder="192.168.1.50" class="focusable" />
         </label>
         <div class="modal-actions">
-          <button id="btn-modal-cancel" class="btn btn-secondary focusable">Cancel</button>
-          <button id="btn-modal-save" class="btn btn-primary focusable">Save PC</button>
+          <button id="btn-modal-cancel" class="btn btn-secondary focusable" data-i18n="btn.cancel">Cancel</button>
+          <button id="btn-modal-save" class="btn btn-primary focusable" data-i18n="btn.save">Save PC</button>
         </div>
+      </div>
+    </div>
+
+    <!-- App Library Modal -->
+    <div id="app-list-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card modal-wide">
+        <div class="modal-header-row">
+          <h3 id="apps-modal-title">Apps</h3>
+          <div class="modal-header-actions">
+            <button id="btn-resume-running" class="btn btn-primary focusable hidden" data-i18n="btn.resumeGame">Resume Running App</button>
+            <button id="btn-quit-running" class="btn btn-danger focusable hidden" data-i18n="btn.quitGame">Quit Running App</button>
+            <button id="btn-apps-close" class="btn btn-secondary focusable" data-i18n="btn.close">Close</button>
+          </div>
+        </div>
+        <div id="apps-grid" class="cards-grid apps-grid"></div>
       </div>
     </div>
 
@@ -213,21 +207,22 @@
         <h3 id="tv-dialog-title">Notice</h3>
         <p id="tv-dialog-body"></p>
         <div class="modal-actions">
-          <button id="btn-dialog-cancel" class="btn btn-secondary focusable hidden">Cancel</button>
-          <button id="btn-dialog-ok" class="btn btn-primary focusable">OK</button>
+          <button id="btn-dialog-cancel" class="btn btn-secondary focusable hidden" data-i18n="btn.cancel">Cancel</button>
+          <button id="btn-dialog-ok" class="btn btn-primary focusable" data-i18n="btn.ok">OK</button>
         </div>
       </div>
     </div>
 
     <!-- Stream View -->
     <div id="stream-view" class="view">
-      <video id="tizen-video-sink" style="display:none" playsinline muted></video>
+      <video id="tizen-video-sink" class="video-sink-hidden" playsinline></video>
       <canvas id="stream-canvas" width="1920" height="1080"></canvas>
       <canvas id="demo-canvas" width="1920" height="1080" style="display:none"></canvas>
 
       <!-- Live Frame Warp & Performance Overlay -->
-      <aside id="stream-overlay" class="stream-overlay">
+      <aside id="stream-overlay" class="stream-overlay hidden">
         <div class="ov-row"><span class="ov-label">Session</span><span id="ov-session">Idle</span></div>
+        <div class="ov-row"><span class="ov-label">FPS (Rx/Dec/Ren)</span><span id="ov-fps">0 / 0 / 0</span></div>
         <div class="ov-row"><span class="ov-label">Frame Warp</span><span id="ov-fw-state">Waiting…</span></div>
         <div class="ov-row"><span class="ov-label">Shift</span><span id="ov-fw-shift">0.0, 0.0 px (peak 0.0)</span></div>
         <div class="ov-row"><span class="ov-label">Lens / HUD</span><span id="ov-fw-lens">Flat · 0 cells</span></div>
@@ -237,12 +232,12 @@
       <!-- Stream Menu Overlay -->
       <div id="stream-menu" class="modal hidden">
         <div class="modal-card">
-          <h3>Stream Menu</h3>
+          <h3 data-i18n="menu.title">Stream Menu</h3>
           <div class="menu-stack">
             <button id="btn-sm-toggle-fw" class="btn btn-secondary focusable">Frame Warp: ON</button>
-            <button id="btn-sm-toggle-overlay" class="btn btn-secondary focusable">Overlay: ON</button>
-            <button id="btn-sm-resume" class="btn btn-primary focusable">Resume Stream</button>
-            <button id="btn-sm-disconnect" class="btn btn-danger focusable">Disconnect</button>
+            <button id="btn-sm-toggle-overlay" class="btn btn-secondary focusable">Overlay: OFF</button>
+            <button id="btn-sm-resume" class="btn btn-primary focusable" data-i18n="menu.resume">Resume Stream</button>
+            <button id="btn-sm-disconnect" class="btn btn-danger focusable" data-i18n="menu.disconnect">Disconnect</button>
           </div>
         </div>
       </div>

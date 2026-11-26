@@ -16,14 +16,25 @@ if(EMSCRIPTEN)
     option(TIZEN_WASM_SDK "Enable Samsung Tizen WASM Player (kVideoTexture) & Sockets Extension" ON)
     option(ENABLE_MOONLIGHT_TRANSPORT "Link pre-fetched moonlight-common-c with Frame Warp v1 hooks" ON)
     set(MOONLIGHT_COMMON_C_DIR "/opt/moonlight-common-c" CACHE PATH "Path to patched moonlight-common-c")
+    set(OPUS_PREFIX "/opt/opus" CACHE PATH "Path to pre-built static libopus")
 
-    add_compile_options(-w -s WASM=1 -Os -DSAMSUNG_WRT -DOS_WASM -DNDEBUG)
+    add_compile_options(-s WASM=1 -O3 -DSAMSUNG_WRT -DOS_WASM -DNDEBUG)
 
     set(NIGHTJAR_WASM_LIBS nightjar_frame_warp)
     set(NIGHTJAR_WASM_DEFS NIGHTJAR_HAVE_CURL_OPENSSL=1)
 
     if(TIZEN_WASM_SDK)
         list(APPEND NIGHTJAR_WASM_DEFS TIZEN_WASM_SDK=1)
+    endif()
+
+    if(EXISTS "${OPUS_PREFIX}/lib/libopus.a")
+        add_library(opus STATIC IMPORTED)
+        set_target_properties(opus PROPERTIES
+            IMPORTED_LOCATION "${OPUS_PREFIX}/lib/libopus.a"
+            INTERFACE_INCLUDE_DIRECTORIES "${OPUS_PREFIX}/include"
+        )
+        list(APPEND NIGHTJAR_WASM_LIBS opus)
+        list(APPEND NIGHTJAR_WASM_DEFS NIGHTJAR_HAVE_OPUS=1)
     endif()
 
     if(ENABLE_MOONLIGHT_TRANSPORT AND EXISTS "${MOONLIGHT_COMMON_C_DIR}/src/Limelight.h")
@@ -34,6 +45,7 @@ if(EMSCRIPTEN)
             "${ML_DIR}/nanors/deps/obl/oblas_common.c"
             "${ML_DIR}/nanors/deps/obl/oblas_lite.c"
         )
+        target_compile_options(moonlight_rs PRIVATE -w)
         target_include_directories(moonlight_rs PUBLIC
             "${ML_DIR}/nanors"
             "${ML_DIR}/nanors/deps"
@@ -51,6 +63,7 @@ if(EMSCRIPTEN)
             "${ML_DIR}/enet/protocol.c"
             "${ML_DIR}/enet/unix.c"
         )
+        target_compile_options(moonlight_enet PRIVATE -w)
         target_compile_definitions(moonlight_enet PUBLIC
             LC_CHROME
             HAS_SOCKLEN_T=1
@@ -61,6 +74,7 @@ if(EMSCRIPTEN)
 
         file(GLOB ML_CORE_SOURCES "${ML_DIR}/src/*.c")
         add_library(moonlight_common_c STATIC ${ML_CORE_SOURCES})
+        target_compile_options(moonlight_common_c PRIVATE -w)
         target_compile_definitions(moonlight_common_c PUBLIC
             LC_CHROME
             HAS_SOCKLEN_T=1
@@ -85,11 +99,13 @@ if(EMSCRIPTEN)
         src/libchelper.c
         src/codec_capabilities.cpp
         src/host_http_client.cpp
+        src/tizen_audio_decoder.cpp
         src/tizen_video_decoder.cpp
         src/warp_gl_renderer.cpp
         src/nightjar_session.cpp
         src/main.cpp
     )
+    target_compile_options(nightjar_tizen PRIVATE -Wall -Wextra)
     target_link_libraries(nightjar_tizen PRIVATE ${NIGHTJAR_WASM_LIBS})
     target_compile_definitions(nightjar_tizen PRIVATE ${NIGHTJAR_WASM_DEFS})
 
@@ -102,12 +118,12 @@ if(EMSCRIPTEN)
     set(EM_LINK_FLAGS
         "--bind"
         "-pthread"
-        "-Os"
-        "-s TOTAL_MEMORY=134217728"
+        "-O3"
+        "-s TOTAL_MEMORY=268435456"
         "-s TOTAL_STACK=16777216"
         "-s NO_EXIT_RUNTIME=1"
         "-s USE_PTHREADS=1"
-        "-s PTHREAD_POOL_SIZE=12"
+        "-s PTHREAD_POOL_SIZE=16"
         "-s WASM=1"
         "-s MODULARIZE=1"
         "-s EXPORT_NAME=NightjarWasmModule"
@@ -125,6 +141,7 @@ else()
     add_executable(frame_warp_cpp_test
         src/codec_capabilities.cpp
         src/host_http_client.cpp
+        src/tizen_audio_decoder.cpp
         src/warp_gl_renderer.cpp
         tests/frame_warp_test.cpp
     )

@@ -1,12 +1,12 @@
 #include "host_http_client.hpp"
 #include "nightjar_session.hpp"
+#include "worker_queue.hpp"
 
 #include <atomic>
 #include <cmath>
 #include <memory>
 #include <mutex>
 #include <sstream>
-#include <thread>
 #include <unordered_map>
 
 #ifdef __EMSCRIPTEN__
@@ -16,7 +16,9 @@
 namespace {
 
 nightjar::tizen::HostHttpClient g_http;
-std::unique_ptr<nightjar::tizen::NightjarSession> g_session;
+nightjar::tizen::WorkerQueue g_worker;
+std::mutex g_session_mutex;
+std::shared_ptr<nightjar::tizen::NightjarSession> g_session;
 std::string g_last_error;
 
 struct AsyncJobResult {
@@ -40,15 +42,21 @@ std::string json_escape(const std::string& s) {
     return out;
 }
 
+std::shared_ptr<nightjar::tizen::NightjarSession> get_session() {
+    std::lock_guard<std::mutex> lk(g_session_mutex);
+    return g_session;
+}
+
 EM_BOOL on_raf(double /*time*/, void* /*user_data*/) {
-    if (g_session) {
-        g_session->on_display_refresh();
+    auto s = get_session();
+    if (s) {
+        s->on_display_refresh();
         return EM_TRUE;
     }
     return EM_FALSE;
 }
 
-std::string init_identity(const std::string& unique_id, const std::string& cert_pem, const std::string& key_pem) {
+std::string init_identity_impl(const std::string& unique_id, const std::string& cert_pem, const std::string& key_pem) {
     g_http.init_identity(unique_id, cert_pem, key_pem);
     const auto& id = g_http.identity();
     std::ostringstream os;
@@ -65,6 +73,7 @@ std::string probe_host_impl(const std::string& address) {
        << "\",\"paired\":" << (info.paired ? "true" : "false")
        << ",\"currentGame\":" << info.current_game
        << ",\"frameWarpVersion\":" << info.frame_warp_version
+       << ",\"codecSupport\":" << info.server_codec_mode_support
        << ",\"error\":\"" << json_escape(info.raw_error) << "\"}";
     return os.str();
 }
@@ -72,9 +81,11 @@ std::string probe_host_impl(const std::string& address) {
 std::string pair_host_impl(const std::string& address, const std::string& pin) {
     std::string err;
     bool ok = g_http.pair_with_pin(address, pin, err);
+    std::string pinned = ok ? g_http.pinned_server_cert(address) : std::string();
     std::ostringstream os;
     os << "{\"ok\":" << (ok ? "true" : "false")
-       << ",\"error\":\"" << json_escape(err) << "\"}";
+       << ",\"serverCertPem\":\"" << json_escape(pinned)
+       << "\",\"error\":\"" << json_escape(err) << "\"}";
     return os.str();
 }
 
@@ -93,27 +104,41 @@ std::string list_apps_impl(const std::string& address) {
     return os.str();
 }
 
-// Spawns network/socket operations on a pthread Web Worker where Samsung's Tizen Sockets Extension lives
-int start_async_job(const std::string& op, const std::string& arg1, const std::string& arg2) {
+// Dispatches all network/socket/crypto operations onto the single persistent pthread WorkerQueue
+int start_async_job(const std::string& op, const std::string& arg1, const std::string& arg2, const std::string& arg3) {
+    if (op == "cancel_pair") {
+        g_http.cancel_pending_pairing();
+        int id = g_next_job_id.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(g_jobs_mutex);
+        g_jobs[id] = AsyncJobResult{true, "{\"ok\":true}"};
+        return id;
+    }
+
     int id = g_next_job_id.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(g_jobs_mutex);
         g_jobs[id] = AsyncJobResult{false, "{}"};
     }
 
-    std::thread([id, op, arg1, arg2]() {
+    g_worker.enqueue([id, op, arg1, arg2, arg3]() {
         std::string payload = "{}";
-        if (op == "probe") {
+        if (op == "init_identity") {
+            payload = init_identity_impl(arg1, arg2, arg3);
+        } else if (op == "probe") {
             payload = probe_host_impl(arg1);
         } else if (op == "pair") {
             payload = pair_host_impl(arg1, arg2);
         } else if (op == "applist") {
             payload = list_apps_impl(arg1);
+        } else if (op == "cancel_app") {
+            bool ok = g_http.cancel_app(arg1);
+            payload = ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"Cancel app failed\"}";
         } else if (op == "connect_stream") {
             std::string err;
             bool ok = false;
-            if (g_session) {
-                ok = g_session->connect_on_worker_thread(err);
+            auto s = get_session();
+            if (s) {
+                ok = s->connect_on_worker_thread(err);
             } else {
                 err = "Stream media session was not prepared";
             }
@@ -121,6 +146,16 @@ int start_async_job(const std::string& op, const std::string& arg1, const std::s
             os << "{\"ok\":" << (ok ? "true" : "false")
                << ",\"error\":\"" << json_escape(err) << "\"}";
             payload = os.str();
+        } else if (op == "stop_stream") {
+            std::shared_ptr<nightjar::tizen::NightjarSession> old;
+            {
+                std::lock_guard<std::mutex> lk(g_session_mutex);
+                old = std::move(g_session);
+            }
+            if (old) {
+                old->stop_network_on_worker();
+            }
+            payload = "{\"ok\":true}";
         } else {
             payload = "{\"error\":\"Unknown async op\"}";
         }
@@ -131,7 +166,7 @@ int start_async_job(const std::string& op, const std::string& arg1, const std::s
             it->second.done = true;
             it->second.payload_json = std::move(payload);
         }
-    }).detach();
+    });
 
     return id;
 }
@@ -150,6 +185,14 @@ std::string poll_async_job(int id) {
     return out;
 }
 
+void set_pinned_cert(const std::string& address, const std::string& cert_pem) {
+    g_http.set_pinned_server_cert(address, cert_pem);
+}
+
+std::string get_pinned_cert(const std::string& address) {
+    return g_http.pinned_server_cert(address);
+}
+
 bool prepare_stream_media(
     const std::string& address,
     int app_id,
@@ -159,10 +202,11 @@ bool prepare_stream_media(
     uint32_t fps,
     const std::string& codec,
     uint32_t bitrate_mbps,
+    bool hdr,
+    bool surround51,
     bool fw_enabled,
-    bool fw_lens,
-    uint16_t fw_mask_width) {
-    g_session = std::make_unique<nightjar::tizen::NightjarSession>(g_http);
+    bool use_video_texture) {
+    auto session = std::make_shared<nightjar::tizen::NightjarSession>(g_http);
     nightjar::tizen::StreamOptions opts;
     opts.host_address = address;
     opts.app_id = app_id;
@@ -172,57 +216,96 @@ bool prepare_stream_media(
     opts.fps = fps;
     opts.codec = codec;
     opts.bitrate_mbps = bitrate_mbps;
+    opts.hdr = hdr;
+    opts.surround51 = surround51;
     opts.frame_warp_enabled = fw_enabled;
-    opts.frame_warp_lens = fw_lens;
-    opts.frame_warp_mask_width = fw_mask_width;
+    opts.frame_warp_lens = true;
+    opts.frame_warp_mask_width = 1024;
+    opts.use_video_texture = use_video_texture;
 
     g_last_error.clear();
-    if (!g_session->init_media_on_main_thread(opts, g_last_error)) {
-        g_session.reset();
+    if (!session->init_media_on_main_thread(opts, g_last_error)) {
         return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_session_mutex);
+        g_session = std::move(session);
     }
     return true;
 }
 
 void start_stream_loop() {
-    if (g_session) {
+    if (get_session()) {
         emscripten_request_animation_frame_loop(on_raf, nullptr);
     }
 }
 
-std::string last_error() { return g_last_error; }
-
-void stop_stream() {
-    if (g_session) {
-        g_session->stop();
-        g_session.reset();
-    }
+void shutdown_media_on_main_thread() {
+    auto s = get_session();
+    if (s) s->shutdown_media_on_main_thread();
 }
 
+std::string last_error() { return g_last_error; }
+
 void set_frame_warp_enabled(bool enabled) {
-    if (g_session) g_session->set_frame_warp_enabled(enabled);
+    if (auto s = get_session()) s->set_frame_warp_enabled(enabled);
 }
 
 void send_mouse(int16_t dx, int16_t dy) {
-    if (g_session) g_session->send_mouse_move(dx, dy);
+    if (auto s = get_session()) s->send_mouse_move(dx, dy);
+}
+
+void send_mouse_button(uint8_t action, int button) {
+    if (auto s = get_session()) s->send_mouse_button(action, button);
+}
+
+void send_mouse_wheel(int8_t clicks) {
+    if (auto s = get_session()) s->send_mouse_wheel(clicks);
+}
+
+void send_key(int16_t key_code, uint8_t action, uint8_t modifiers) {
+    if (auto s = get_session()) s->send_key(key_code, action, modifiers);
+}
+
+void send_controller_arrival(uint8_t index, uint16_t active_mask) {
+    if (auto s = get_session()) s->send_controller_arrival(index, active_mask);
 }
 
 void send_controller(
-    uint16_t index, int buttons, uint8_t lt, uint8_t rt,
+    uint16_t index, uint16_t active_mask, int buttons, uint8_t lt, uint8_t rt,
     int16_t lx, int16_t ly, int16_t rx, int16_t ry) {
-    if (g_session) g_session->send_controller_packet(index, buttons, lt, rt, lx, ly, rx, ry);
+    if (auto s = get_session()) {
+        s->send_controller_packet(index, active_mask, buttons, lt, rt, lx, ly, rx, ry);
+    }
+}
+
+std::string poll_session_events() {
+    auto s = get_session();
+    if (!s) return "[]";
+    auto evs = s->drain_events();
+    std::ostringstream os;
+    os << "[";
+    for (size_t i = 0; i < evs.size(); ++i) {
+        if (i > 0) os << ",";
+        os << "{\"type\":\"" << json_escape(evs[i].type)
+           << "\",\"code\":" << evs[i].code << "}";
+    }
+    os << "]";
+    return os.str();
 }
 
 std::string get_frame_warp_status() {
-    if (!g_session) return "{}";
-    auto st = g_session->frame_warp_status();
+    auto s = get_session();
+    if (!s) return "{}";
+    auto st = s->frame_warp_status();
+    auto stats = s->session_stats();
     bool locked = st.model.has_value() && st.model->locked();
     float fov = 0.0f;
     if (st.model.has_value() && st.model->focal > 0.0f) {
         fov = 2.0f * std::atan((static_cast<float>(st.model->picture_width) * 0.5f) / st.model->focal) * 180.0f / 3.14159265f;
     }
     std::ostringstream os;
-    os << "{\"negotiated\":" << (g_session->frame_warp_negotiated() ? "true" : "false")
+    os << "{\"negotiated\":" << (s->frame_warp_negotiated() ? "true" : "false")
        << ",\"locked\":" << (locked ? "true" : "false")
        << ",\"pxX\":" << st.pixels[0]
        << ",\"pxY\":" << st.pixels[1]
@@ -231,24 +314,32 @@ std::string get_frame_warp_status() {
        << ",\"maskCells\":" << st.mask_cells
        << ",\"warped\":" << st.warped
        << ",\"extrapolated\":" << st.extrapolated
-       << ",\"untagged\":" << st.untagged << "}";
+       << ",\"untagged\":" << st.untagged
+       << ",\"rxFps\":" << stats.rx_fps
+       << ",\"decodedFps\":" << stats.decoded_fps
+       << ",\"renderedFps\":" << stats.rendered_fps
+       << ",\"hdrActive\":" << (stats.hdr_active ? "true" : "false")
+       << ",\"directScanout\":" << (stats.direct_scanout ? "true" : "false") << "}";
     return os.str();
 }
 
 EMSCRIPTEN_BINDINGS(nightjar_tizen) {
-    emscripten::function("initIdentity", &init_identity);
     emscripten::function("startAsyncJob", &start_async_job);
     emscripten::function("pollAsyncJob", &poll_async_job);
+    emscripten::function("setPinnedCert", &set_pinned_cert);
+    emscripten::function("getPinnedCert", &get_pinned_cert);
     emscripten::function("prepareStreamMedia", &prepare_stream_media);
     emscripten::function("startStreamLoop", &start_stream_loop);
-    emscripten::function("probeHost", &probe_host_impl);
-    emscripten::function("pairHost", &pair_host_impl);
-    emscripten::function("listApps", &list_apps_impl);
+    emscripten::function("shutdownMedia", &shutdown_media_on_main_thread);
     emscripten::function("lastError", &last_error);
-    emscripten::function("stopStream", &stop_stream);
     emscripten::function("setFrameWarpEnabled", &set_frame_warp_enabled);
     emscripten::function("sendMouse", &send_mouse);
+    emscripten::function("sendMouseButton", &send_mouse_button);
+    emscripten::function("sendMouseWheel", &send_mouse_wheel);
+    emscripten::function("sendKey", &send_key);
+    emscripten::function("sendControllerArrival", &send_controller_arrival);
     emscripten::function("sendController", &send_controller);
+    emscripten::function("pollSessionEvents", &poll_session_events);
     emscripten::function("getFrameWarpStatus", &get_frame_warp_status);
 }
 

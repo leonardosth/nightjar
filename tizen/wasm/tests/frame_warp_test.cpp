@@ -2,10 +2,15 @@
 #include "frame_warp_predictor.hpp"
 #include "frame_warp_protocol.hpp"
 #include "host_http_client.hpp"
+#include "tizen_audio_decoder.hpp"
+#include "worker_queue.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
+#include <future>
 #include <iostream>
+#include <vector>
 
 using namespace nightjar::frame_warp;
 using namespace nightjar::tizen;
@@ -99,6 +104,41 @@ int main() {
     assert(c1.identity().unique_id != c2.identity().unique_id);
     c1.set_pinned_server_cert("192.168.1.50", "CERT_PEM");
     assert(c1.pinned_server_cert("192.168.1.50") == "CERT_PEM");
+
+    // 9. WorkerQueue executes 50 jobs in strict FIFO order on a single worker thread
+    {
+        WorkerQueue wq;
+        std::vector<int> order;
+        std::mutex order_mu;
+        std::promise<void> done_promise;
+        for (int i = 0; i < 50; ++i) {
+            wq.enqueue([&, i]() {
+                {
+                    std::lock_guard<std::mutex> lk(order_mu);
+                    order.push_back(i);
+                }
+                if (i == 49) done_promise.set_value();
+            });
+        }
+        done_promise.get_future().wait();
+        assert(order.size() == 50);
+        for (int i = 0; i < 50; ++i) assert(order[static_cast<size_t>(i)] == i);
+    }
+
+    // 10. TizenAudioDecoder advances monotonic audio PTS safely in host-test mode
+    {
+        TizenAudioDecoder audio;
+        AudioConfig acfg;
+        acfg.sample_rate = 48000;
+        acfg.channel_count = 2;
+        acfg.samples_per_frame = 240;
+        assert(audio.initialize(acfg, nullptr));
+        const uint8_t dummy[4] = {0, 0, 0, 0};
+        audio.decode_and_play(dummy, sizeof(dummy));
+        audio.decode_and_play(dummy, sizeof(dummy));
+        assert(std::fabs(audio.current_pts_sec() - (480.0 / 48000.0)) < 1e-6);
+        audio.shutdown();
+    }
 
     std::cout << "All C++ Frame Warp & HostHttpClient tests passed!\n";
     return 0;

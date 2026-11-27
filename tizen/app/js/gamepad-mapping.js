@@ -99,6 +99,86 @@ export function computeActiveGamepadMask(rawPads) {
   return mask;
 }
 
+export function assignControllerSlots(slotByPad, rawPads) {
+  const slots = new Map();
+  const used = new Set();
+  const arrived = [];
+  const removed = [];
+  const limit = rawPads ? Math.min(rawPads.length, 16) : 0;
+
+  if (slotByPad) {
+    for (const [padIdx, slot] of slotByPad.entries()) {
+      const pad = padIdx >= 0 && padIdx < limit ? rawPads[padIdx] : null;
+      if (pad && pad.connected !== false && slot >= 0 && slot < 16 && !used.has(slot)) {
+        slots.set(padIdx, slot);
+        used.add(slot);
+      } else {
+        removed.push({ pad: padIdx, slot });
+      }
+    }
+  }
+
+  for (let i = 0; i < limit; i++) {
+    const pad = rawPads[i];
+    if (!pad || pad.connected === false || slots.has(i)) continue;
+    for (let slot = 0; slot < 16; slot++) {
+      if (!used.has(slot)) {
+        slots.set(i, slot);
+        used.add(slot);
+        arrived.push({ pad: i, slot });
+        break;
+      }
+    }
+  }
+
+  let mask = 0;
+  for (const s of used) {
+    mask |= 1 << s;
+  }
+  return { slots, mask, arrived, removed };
+}
+
+export class NavRepeat {
+  constructor({ initialDelayMs = 400, repeatMs = 140 } = {}) {
+    this.initialDelayMs = initialDelayMs;
+    this.repeatMs = repeatMs;
+    this._dir = null;
+    this._pressedAt = 0;
+    this._lastFiredAt = 0;
+    this._repeated = false;
+  }
+
+  update(dir, nowMs) {
+    if (!dir) {
+      this._dir = null;
+      this._pressedAt = 0;
+      this._lastFiredAt = 0;
+      this._repeated = false;
+      return null;
+    }
+    if (dir !== this._dir) {
+      this._dir = dir;
+      this._pressedAt = nowMs;
+      this._lastFiredAt = nowMs;
+      this._repeated = false;
+      return dir;
+    }
+    if (!this._repeated) {
+      if ((nowMs - this._pressedAt) >= this.initialDelayMs) {
+        this._repeated = true;
+        this._lastFiredAt = nowMs;
+        return dir;
+      }
+      return null;
+    }
+    if ((nowMs - this._lastFiredAt) >= this.repeatMs) {
+      this._lastFiredAt = nowMs;
+      return dir;
+    }
+    return null;
+  }
+}
+
 export function shouldSendGamepadState(prev, next, nowMs, heartbeatMs = 250) {
   if (!prev) return true;
   if (

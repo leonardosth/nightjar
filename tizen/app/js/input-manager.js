@@ -9,8 +9,9 @@
 
 import {
   MOONLIGHT_BUTTONS,
+  NavRepeat,
+  assignControllerSlots,
   mapStandardGamepad,
-  computeActiveGamepadMask,
   shouldSendGamepadState,
 } from './gamepad-mapping.js';
 
@@ -83,11 +84,12 @@ export class InputManager {
     this.streaming = false;
     this.demoMode = false;
     this.menuOpen = false;
-    this.lastNavAt = 0;
     this.lastMenuChord = false;
     this._lastPadCount = -1;
-    this._arrivedMask = 0;
+    this._slotByPad = new Map();
     this._lastSentState = new Array(16).fill(null);
+    this._navRepeats = Array.from({ length: 16 }, () => new NavRepeat());
+    this._prevButtons = Array.from({ length: 16 }, () => ({ a: false, b: false }));
     this._raf = null;
 
     this._registerTizenKeys();
@@ -157,6 +159,7 @@ export class InputManager {
           return;
         }
         ev.preventDefault();
+        if (ev.repeat) return;
         if (this.menuOpen) {
           this.onStreamMenu();
         } else {
@@ -167,14 +170,14 @@ export class InputManager {
 
       if (this.menuOpen && isMenu) {
         ev.preventDefault();
-        this.onStreamMenu();
+        if (!ev.repeat) this.onStreamMenu();
         return;
       }
 
       if (code === TIZEN_KEY_RED || key === 'ColorF0Red' || key === 'Delete') {
         if (tagName !== 'INPUT' && tagName !== 'TEXTAREA' && this.onDelete) {
           ev.preventDefault();
-          this.onDelete();
+          if (!ev.repeat) this.onDelete();
           return;
         }
       }
@@ -192,7 +195,7 @@ export class InputManager {
       else if (isEnter) {
         if (tagName !== 'SELECT' && tagName !== 'INPUT') {
           ev.preventDefault();
-          this.onNavigate('select');
+          if (!ev.repeat) this.onNavigate('select');
         }
       }
     });
@@ -250,14 +253,31 @@ export class InputManager {
     this.onGamepadStatus(pads);
   }
 
+  _seedButtonEdges() {
+    const rawPads = typeof navigator !== 'undefined' && navigator.getGamepads ? navigator.getGamepads() : [];
+    const limit = Math.min(rawPads.length, 16);
+    for (let i = 0; i < 16; i++) {
+      const pad = i < limit ? rawPads[i] : null;
+      const connected = Boolean(pad && pad.connected !== false);
+      this._prevButtons[i] = {
+        a: connected && Boolean(pad.buttons?.[0]?.pressed),
+        b: connected && Boolean(pad.buttons?.[1]?.pressed),
+      };
+      this._navRepeats[i].update(null, 0);
+    }
+  }
+
   _startGamepadLoop() {
     const poll = (now) => {
       const rawPads = navigator.getGamepads ? navigator.getGamepads() : [];
-      const activeMask = computeActiveGamepadMask(rawPads);
+      const limit = Math.min(rawPads.length, 16);
       const connectedPads = [];
-      for (let i = 0; i < Math.min(rawPads.length, 16); i++) {
+      for (let i = 0; i < limit; i++) {
         if (rawPads[i] && rawPads[i].connected !== false) {
           connectedPads.push(rawPads[i]);
+        } else {
+          this._prevButtons[i] = { a: false, b: false };
+          this._navRepeats[i].update(null, now);
         }
       }
       if (connectedPads.length !== this._lastPadCount) {
@@ -266,70 +286,84 @@ export class InputManager {
       }
 
       if (this.streaming) {
-        for (let i = 0; i < 16; i++) {
-          const bit = 1 << i;
-          const isConnected = (activeMask & bit) !== 0;
-          if (isConnected && (this._arrivedMask & bit) === 0) {
-            this._arrivedMask |= bit;
-            this._lastSentState[i] = null;
-            this.onControllerArrival?.(i, activeMask);
-          } else if (!isConnected && (this._arrivedMask & bit) !== 0) {
-            this._arrivedMask &= ~bit;
-            this._lastSentState[i] = null;
-            this.onControllerPacket?.(i, activeMask, {
-              buttons: 0,
-              leftTrigger: 0,
-              rightTrigger: 0,
-              leftStickX: 0,
-              leftStickY: 0,
-              rightStickX: 0,
-              rightStickY: 0,
-            });
+        const { slots, mask, arrived, removed } = assignControllerSlots(this._slotByPad, rawPads);
+        this._slotByPad = slots;
+
+        for (const { slot } of removed) {
+          this._lastSentState[slot] = null;
+          this.onControllerPacket?.(slot, mask, {
+            buttons: 0,
+            leftTrigger: 0,
+            rightTrigger: 0,
+            leftStickX: 0,
+            leftStickY: 0,
+            rightStickX: 0,
+            rightStickY: 0,
+          });
+        }
+        for (const { slot } of arrived) {
+          this._lastSentState[slot] = null;
+          this.onControllerArrival?.(slot, mask);
+        }
+
+        if (!this.menuOpen) {
+          for (const [padIdx, slot] of slots.entries()) {
+            const pad = rawPads[padIdx];
+            if (!pad || pad.connected === false) continue;
+            const mapped = mapStandardGamepad(pad);
+            // Nightjar chord: LB + RB + Start + Back opens stream menu
+            const chordMask =
+              MOONLIGHT_BUTTONS.LB |
+              MOONLIGHT_BUTTONS.RB |
+              MOONLIGHT_BUTTONS.PLAY |
+              MOONLIGHT_BUTTONS.BACK;
+            const chord = (mapped.buttons & chordMask) === chordMask;
+            if (chord && !this.lastMenuChord) {
+              this.onStreamMenu();
+            }
+            this.lastMenuChord = chord;
+
+            // Keep sending fresh right-stick samples while deflected for Frame Warp integration
+            const stickDeflected =
+              Math.abs(mapped.rightStickX) > 2600 || Math.abs(mapped.rightStickY) > 2600;
+            if (stickDeflected || shouldSendGamepadState(this._lastSentState[slot], mapped, now)) {
+              this._lastSentState[slot] = { ...mapped, sentAt: now };
+              this.onControllerPacket(slot, mask, mapped);
+            }
           }
         }
       }
 
-      for (let i = 0; i < Math.min(rawPads.length, 16); i++) {
-        const pad = rawPads[i];
-        if (!pad || pad.connected === false) continue;
+      if (!this.streaming || this.menuOpen) {
+        for (let i = 0; i < limit; i++) {
+          const pad = rawPads[i];
+          if (!pad || pad.connected === false) continue;
 
-        if (this.streaming && !this.menuOpen) {
-          const mapped = mapStandardGamepad(pad);
-          // Nightjar chord: LB + RB + Start + Back opens stream menu
-          const chordMask =
-            MOONLIGHT_BUTTONS.LB |
-            MOONLIGHT_BUTTONS.RB |
-            MOONLIGHT_BUTTONS.PLAY |
-            MOONLIGHT_BUTTONS.BACK;
-          const chord = (mapped.buttons & chordMask) === chordMask;
-          if (chord && !this.lastMenuChord) {
-            this.onStreamMenu();
-          }
-          this.lastMenuChord = chord;
-
-          // Keep sending fresh right-stick samples while deflected for Frame Warp integration
-          const stickDeflected =
-            Math.abs(mapped.rightStickX) > 2600 || Math.abs(mapped.rightStickY) > 2600;
-          if (stickDeflected || shouldSendGamepadState(this._lastSentState[i], mapped, now)) {
-            this._lastSentState[i] = { ...mapped, sentAt: now };
-            this.onControllerPacket(i, activeMask, mapped);
-          }
-        } else if (now - this.lastNavAt > 170) {
           const ax = pad.axes[0] || 0;
           const ay = pad.axes[1] || 0;
           const hatX = pad.mapping !== 'standard' && pad.axes.length >= 8 ? (pad.axes[6] || 0) : 0;
           const hatY = pad.mapping !== 'standard' && pad.axes.length >= 8 ? (pad.axes[7] || 0) : 0;
 
-          if (pad.buttons[12]?.pressed || ay < -0.55 || hatY < -0.5) { this.lastNavAt = now; this.onNavigate('up'); }
-          else if (pad.buttons[13]?.pressed || ay > 0.55 || hatY > 0.5) { this.lastNavAt = now; this.onNavigate('down'); }
-          else if (pad.buttons[14]?.pressed || ax < -0.55 || hatX < -0.5) { this.lastNavAt = now; this.onNavigate('left'); }
-          else if (pad.buttons[15]?.pressed || ax > 0.55 || hatX > 0.5) { this.lastNavAt = now; this.onNavigate('right'); }
-          else if (pad.buttons[0]?.pressed) { this.lastNavAt = now; this.onNavigate('select'); }
-          else if (pad.buttons[1]?.pressed) {
-            this.lastNavAt = now;
+          let dir = null;
+          if (pad.buttons[12]?.pressed || ay < -0.55 || hatY < -0.5) dir = 'up';
+          else if (pad.buttons[13]?.pressed || ay > 0.55 || hatY > 0.5) dir = 'down';
+          else if (pad.buttons[14]?.pressed || ax < -0.55 || hatX < -0.5) dir = 'left';
+          else if (pad.buttons[15]?.pressed || ax > 0.55 || hatX > 0.5) dir = 'right';
+
+          const fireDir = this._navRepeats[i].update(dir, now);
+          if (fireDir) this.onNavigate(fireDir);
+
+          const aPressed = Boolean(pad.buttons[0]?.pressed);
+          const bPressed = Boolean(pad.buttons[1]?.pressed);
+          if (aPressed && !this._prevButtons[i].a) {
+            this.onNavigate('select');
+          }
+          if (bPressed && !this._prevButtons[i].b) {
             if (this.menuOpen) this.onStreamMenu();
             else this.onBack();
           }
+          this._prevButtons[i].a = aPressed;
+          this._prevButtons[i].b = bPressed;
         }
       }
       this._raf = requestAnimationFrame(poll);
@@ -342,13 +376,15 @@ export class InputManager {
     this.demoMode = active && demo;
     this.menuOpen = false;
     this.lastMenuChord = false;
-    this._arrivedMask = 0;
+    this._slotByPad = new Map();
     this._lastSentState.fill(null);
+    this._seedButtonEdges();
   }
 
   setMenuOpen(open) {
     this.menuOpen = Boolean(open);
     this.lastMenuChord = false;
+    this._seedButtonEdges();
   }
 
   destroy() {

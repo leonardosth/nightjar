@@ -201,6 +201,7 @@ int main() {
         assert(!tr.swap_to_display(f, recycle)); // stale callback ignored
 
         // filled_us timestamp round-trips through mark_filled -> swap_to_display
+        tr.reset();
         auto s5 = tr.acquire_for_fill();
         assert(s5.has_value());
         std::optional<GLuint> sup5;

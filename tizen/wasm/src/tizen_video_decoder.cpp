@@ -137,8 +137,21 @@ struct TizenVideoDecoder::Impl
     std::function<void(void*)> on_source_ready_for_tracks;
     TextureRing* ring_ref = nullptr;
 
+    // Live diagnostics surfaced in the TV overlay
+    std::atomic<int> src_closed_count{0};
+    std::atomic<int> open_pending_count{0};
+    std::atomic<int> vtrack_op{-1};
+    std::atomic<int> open_op{-1};
+    std::atomic<int> play_op{-1};
+    std::atomic<int> reg_gl_ok{-1};
+    std::atomic<uint32_t> append_ok{0};
+    std::atomic<uint32_t> append_err{0};
+    std::atomic<int> last_append_op{-1};
+    std::atomic<int> last_fill_op{-1};
+
     void attach_tracks_and_open() {
         if (!source) return;
+        src_closed_count.fetch_add(1, std::memory_order_relaxed);
         if (!has_track) {
             const uint32_t eff_fps = fps ? fps : 60u;
             const std::string primary_mime = build_video_mime(codec, width, height, eff_fps, hdr10);
@@ -163,6 +176,7 @@ struct TizenVideoDecoder::Impl
                     add_res = try_add(fallback_mime);
                 }
             }
+            vtrack_op.store(static_cast<int>(add_res.operation_result), std::memory_order_relaxed);
             if (!add_res) {
                 return;
             }
@@ -174,10 +188,13 @@ struct TizenVideoDecoder::Impl
                 on_source_ready_for_tracks(static_cast<void*>(source.get()));
             }
             if (use_video_texture) {
-                (void)video_track.RegisterCurrentGraphicsContext();
+                auto rg = video_track.RegisterCurrentGraphicsContext();
+                reg_gl_ok.store(rg ? 1 : 0, std::memory_order_relaxed);
             }
         }
-        source->Open([](samsung::wasm::OperationResult) {});
+        source->Open([this](samsung::wasm::OperationResult r) {
+            open_op.store(static_cast<int>(r), std::memory_order_relaxed);
+        });
     }
 
     void OnSourceClosed() override {
@@ -187,8 +204,11 @@ struct TizenVideoDecoder::Impl
     }
 
     void OnSourceOpenPending() override {
+        open_pending_count.fetch_add(1, std::memory_order_relaxed);
         if (media_element) {
-            media_element->Play([](samsung::wasm::OperationResult) {});
+            media_element->Play([this](samsung::wasm::OperationResult r) {
+                play_op.store(static_cast<int>(r), std::memory_order_relaxed);
+            });
         }
     }
 
@@ -340,7 +360,14 @@ bool TizenVideoDecoder::submit_access_unit(
         1u,
         impl_->session_id.load(std::memory_order_acquire),
     };
-    return static_cast<bool>(impl_->video_track.AppendPacket(pkt));
+    auto ap_res = impl_->video_track.AppendPacket(pkt);
+    impl_->last_append_op.store(static_cast<int>(ap_res.operation_result), std::memory_order_relaxed);
+    if (ap_res) {
+        impl_->append_ok.fetch_add(1u, std::memory_order_relaxed);
+        return true;
+    }
+    impl_->append_err.fetch_add(1u, std::memory_order_relaxed);
+    return false;
 #else
     (void)keyframe;
     return true;
@@ -362,6 +389,7 @@ bool TizenVideoDecoder::poll_next_frame(GLuint& out_tex, uint32_t& out_frame, bo
                 fill_tex,
                 [this, alive, slot_idx, gen](samsung::wasm::OperationResult res) {
                     if (!alive->load(std::memory_order_acquire)) return;
+                    impl_->last_fill_op.store(static_cast<int>(res), std::memory_order_relaxed);
                     if (res != samsung::wasm::OperationResult::kSuccess) {
                         ring_.mark_fill_aborted(slot_idx, gen);
                         return;
@@ -408,6 +436,25 @@ bool TizenVideoDecoder::poll_next_frame(GLuint& out_tex, uint32_t& out_frame, bo
     (void)out_frame;
     out_tagged = false;
     return false;
+#endif
+}
+
+std::string TizenVideoDecoder::diagnostic_summary() const {
+#if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
+    if (!impl_) return "no-impl";
+    return "sc=" + std::to_string(impl_->src_closed_count.load(std::memory_order_relaxed)) +
+           " vt=" + std::to_string(impl_->vtrack_op.load(std::memory_order_relaxed)) +
+           " gl=" + std::to_string(impl_->reg_gl_ok.load(std::memory_order_relaxed)) +
+           " op=" + std::to_string(impl_->open_op.load(std::memory_order_relaxed)) +
+           " pd=" + std::to_string(impl_->open_pending_count.load(std::memory_order_relaxed)) +
+           " pl=" + std::to_string(impl_->play_op.load(std::memory_order_relaxed)) +
+           " to=" + std::to_string(impl_->track_open.load(std::memory_order_relaxed) ? 1 : 0) +
+           " ap=" + std::to_string(impl_->append_ok.load(std::memory_order_relaxed)) +
+           "/" + std::to_string(impl_->append_err.load(std::memory_order_relaxed)) +
+           "(" + std::to_string(impl_->last_append_op.load(std::memory_order_relaxed)) + ")" +
+           " fl=" + std::to_string(impl_->last_fill_op.load(std::memory_order_relaxed));
+#else
+    return "native";
 #endif
 }
 

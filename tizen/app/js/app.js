@@ -729,6 +729,10 @@ class NightjarTizenApp {
     document.getElementById('ov-fw-lens').textContent = `${lensText} · ${s.maskCells} mask cells`;
     document.getElementById('ov-fw-frames').textContent =
       `${s.warped} warped · ${s.extrapolated} extrap · ${s.untagged} untagged`;
+    const stageEl = document.getElementById('ov-stage');
+    if (stageEl) stageEl.textContent = s.stage || '—';
+    const diagEl = document.getElementById('ov-diag');
+    if (diagEl) diagEl.textContent = s.diag || '—';
   }
 }
 

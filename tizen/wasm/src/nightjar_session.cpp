@@ -27,6 +27,18 @@ NightjarSession* active_session() {
 }
 
 #ifdef NIGHTJAR_HAVE_MOONLIGHT
+void cb_stage_starting(int stage) {
+    if (auto* s = active_session()) s->on_stage_starting(LiGetStageName(stage));
+}
+
+void cb_stage_complete(int stage) {
+    if (auto* s = active_session()) s->on_stage_complete(LiGetStageName(stage));
+}
+
+void cb_stage_failed(int stage, int error_code) {
+    if (auto* s = active_session()) s->on_stage_failed(LiGetStageName(stage), error_code);
+}
+
 void cb_connection_started() {
     if (auto* s = active_session()) s->on_connection_started();
 }
@@ -288,6 +300,9 @@ bool NightjarSession::connect_on_worker_thread(std::string& out_error) {
 
     CONNECTION_LISTENER_CALLBACKS cl{};
     LiInitializeConnectionCallbacks(&cl);
+    cl.stageStarting = cb_stage_starting;
+    cl.stageComplete = cb_stage_complete;
+    cl.stageFailed = cb_stage_failed;
     cl.connectionStarted = cb_connection_started;
     cl.connectionTerminated = cb_connection_terminated;
     cl.connectionStatusUpdate = cb_connection_status_update;
@@ -368,7 +383,26 @@ void NightjarSession::send_frame_warp_request(bool enabled) {
 #endif
 }
 
+void NightjarSession::on_stage_starting(const char* name) {
+    std::lock_guard<std::mutex> lk(events_mu_);
+    stage_text_ = std::string("Starting ") + (name ? name : "?");
+}
+
+void NightjarSession::on_stage_complete(const char* name) {
+    std::lock_guard<std::mutex> lk(events_mu_);
+    stage_text_ = std::string("Done ") + (name ? name : "?");
+}
+
+void NightjarSession::on_stage_failed(const char* name, int error_code) {
+    std::lock_guard<std::mutex> lk(events_mu_);
+    stage_text_ = std::string("FAILED ") + (name ? name : "?") + " (" + std::to_string(error_code) + ")";
+}
+
 void NightjarSession::on_connection_started() {
+    {
+        std::lock_guard<std::mutex> lk(events_mu_);
+        stage_text_ = "Connected";
+    }
 #ifdef NIGHTJAR_HAVE_MOONLIGHT
     // Strictly capability-gated: requires BOTH <FrameWarpVersion> >= 1 AND RTSP a=x-rl-control 0x5543
     if (opts_.frame_warp_enabled && opts_.use_video_texture && host_frame_warp_version_ >= 1 && LiHasFrameWarpControl()) {
@@ -568,6 +602,15 @@ SessionStats NightjarSession::session_stats() const {
     s.hdr_active = hdr_active_.load(std::memory_order_relaxed);
     s.direct_scanout = decoder_ ? decoder_->is_direct_scanout() : !opts_.use_video_texture;
     return s;
+}
+
+std::string NightjarSession::stage_summary() const {
+    std::lock_guard<std::mutex> lk(events_mu_);
+    return stage_text_;
+}
+
+std::string NightjarSession::decoder_summary() const {
+    return decoder_ ? decoder_->diagnostic_summary() : "no-decoder";
 }
 
 frame_warp::Status NightjarSession::frame_warp_status() const {

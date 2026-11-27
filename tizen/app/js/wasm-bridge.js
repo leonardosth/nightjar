@@ -215,46 +215,7 @@ export class WasmStreamSession {
       video.className = this.useVideoTexture ? 'video-sink-hidden' : 'video-sink-direct';
     }
 
-    if (typeof this.runtime.prepareStreamMedia === 'function' && typeof this.runtime.startAsyncJob === 'function') {
-      const prepOk = this.runtime.prepareStreamMedia(
-        this.host.address,
-        this.appId || 0,
-        Boolean(this.resume),
-        width,
-        height,
-        Number(this.settings.fps) || 60,
-        this.settings.codec || 'hevc',
-        Number(this.settings.bitrate) || 100,
-        Boolean(this.settings.hdr),
-        Boolean(this.settings.surround51),
-        this.enabled,
-        this.useVideoTexture
-      );
-      if (!prepOk) {
-        throw new Error(this.runtime.lastError ? this.runtime.lastError() : 'Failed to initialize TV WebGL / video decoder');
-      }
-      const conn = await runWasmJobAsync(
-        this.runtime,
-        'connect_stream',
-        this.host.address,
-        String(this.appId || 0),
-        '',
-        { timeoutMs: 30000 }
-      );
-      if (!conn || !conn.ok) {
-        throw new Error((conn && conn.error) || 'Failed to connect stream');
-      }
-      if (this._stopped) {
-        return;
-      }
-      if (typeof this.runtime.startStreamLoop === 'function') {
-        this.runtime.startStreamLoop();
-      }
-    } else {
-      throw new Error('WASM pthread streaming bridge needs updated WASM build');
-    }
-
-    this._timer = setInterval(() => {
+    const pollOverlay = () => {
       if (this._stopped) return;
       if (typeof this.runtime.pollSessionEvents === 'function') {
         try {
@@ -293,11 +254,56 @@ export class WasmStreamSession {
           warped: st.warped || 0,
           extrapolated: st.extrapolated || 0,
           untagged: st.untagged || 0,
+          stage: st.stage || '—',
+          diag: st.diag || '—',
         });
       } catch {
         // ignore
       }
-    }, 100);
+    };
+
+    if (typeof this.runtime.prepareStreamMedia === 'function' && typeof this.runtime.startAsyncJob === 'function') {
+      const prepOk = this.runtime.prepareStreamMedia(
+        this.host.address,
+        this.appId || 0,
+        Boolean(this.resume),
+        width,
+        height,
+        Number(this.settings.fps) || 60,
+        this.settings.codec || 'hevc',
+        Number(this.settings.bitrate) || 100,
+        Boolean(this.settings.hdr),
+        Boolean(this.settings.surround51),
+        this.enabled,
+        this.useVideoTexture
+      );
+      if (!prepOk) {
+        throw new Error(this.runtime.lastError ? this.runtime.lastError() : 'Failed to initialize TV WebGL / video decoder');
+      }
+      // Start overlay polling BEFORE connect_stream so live RTSP/EMSS stages show immediately
+      this._timer = setInterval(pollOverlay, 100);
+      pollOverlay();
+
+      const conn = await runWasmJobAsync(
+        this.runtime,
+        'connect_stream',
+        this.host.address,
+        String(this.appId || 0),
+        '',
+        { timeoutMs: 30000 }
+      );
+      if (!conn || !conn.ok) {
+        throw new Error((conn && conn.error) || 'Failed to connect stream');
+      }
+      if (this._stopped) {
+        return;
+      }
+      if (typeof this.runtime.startStreamLoop === 'function') {
+        this.runtime.startStreamLoop();
+      }
+    } else {
+      throw new Error('WASM pthread streaming bridge needs updated WASM build');
+    }
   }
 
   setFrameWarpEnabled(enabled) {

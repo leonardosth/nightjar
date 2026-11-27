@@ -104,6 +104,7 @@ public:
 
     void* emss_source() const;
     bool is_direct_scanout() const { return !config_.use_video_texture; }
+    std::string diagnostic_summary() const;
 
     void shutdown();
 

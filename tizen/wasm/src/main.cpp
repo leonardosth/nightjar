@@ -331,7 +331,9 @@ std::string get_frame_warp_status() {
        << ",\"decodedFps\":" << stats.decoded_fps
        << ",\"renderedFps\":" << stats.rendered_fps
        << ",\"hdrActive\":" << (stats.hdr_active ? "true" : "false")
-       << ",\"directScanout\":" << (stats.direct_scanout ? "true" : "false") << "}";
+       << ",\"directScanout\":" << (stats.direct_scanout ? "true" : "false")
+       << ",\"stage\":\"" << json_escape(s->stage_summary()) << "\""
+       << ",\"diag\":\"" << json_escape(s->decoder_summary()) << "\"}";
     return os.str();
 }
 

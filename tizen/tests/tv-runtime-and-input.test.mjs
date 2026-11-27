@@ -400,4 +400,99 @@ test('WasmStreamSession polls termination events and invokes onTerminated with e
   }
 });
 
+test('WasmStreamSession.stop awaits stop_stream BEFORE calling shutdownMedia to prevent teardown UAF', async () => {
+  const order = [];
+  const runtime = {
+    startAsyncJob(op) {
+      if (op === 'stop_stream') order.push('stop_stream_start');
+      return 1;
+    },
+    pollAsyncJob() {
+      order.push('stop_stream_done');
+      return JSON.stringify({ done: true, payload: { ok: true } });
+    },
+    shutdownMedia() {
+      order.push('shutdownMedia');
+    },
+  };
+  const session = new WasmStreamSession(
+    runtime,
+    { name: 'Host', address: '192.168.1.50', frameWarpVersion: 1 },
+    101,
+    { resolution: '3840x2160', fps: '60', codec: 'hevc', bitrate: '100', fwEnabled: true }
+  );
+  await session.stop();
+  assert.deepEqual(order, ['stop_stream_start', 'stop_stream_done', 'shutdownMedia']);
+});
+
+test('InputManager routes D-Pad and Enter to navigation when stream menu is open, sends +-1 wheel clicks, and zeroes pad on disconnect', () => {
+  const origWindow = globalThis.window;
+  const origNavigator = globalThis.navigator;
+  const origRAF = globalThis.requestAnimationFrame;
+  const origCAF = globalThis.cancelAnimationFrame;
+
+  const listeners = new Map();
+  let rafCb = null;
+  let connected = true;
+
+  try {
+    globalThis.window = {
+      addEventListener(type, fn) { listeners.set(type, fn); },
+    };
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: {
+        getGamepads: () => (connected ? [{
+          id: 'Pad 0',
+          mapping: 'standard',
+          connected: true,
+          axes: [0, 0, 0, 0],
+          buttons: Array.from({ length: 16 }, () => ({ pressed: false, value: 0 })),
+        }] : [null]),
+      },
+    });
+    globalThis.requestAnimationFrame = (cb) => { rafCb = cb; return 1; };
+    globalThis.cancelAnimationFrame = () => {};
+
+    const navEvents = [];
+    const wheelClicks = [];
+    const padPackets = [];
+    const mgr = new InputManager({
+      onNavigate: (d) => navEvents.push(d),
+      onBack: () => {},
+      onStreamMenu: () => {},
+      onMouseMove: () => {},
+      onMouseWheel: (c) => wheelClicks.push(c),
+      onControllerPacket: (idx, mask, st) => padPackets.push({ idx, mask, st }),
+      onGamepadStatus: () => {},
+    });
+
+    mgr.setStreaming(true);
+    // Wheel must send +-1 click (LiSendScrollEvent multiplies by 120 internally)
+    listeners.get('wheel')({ deltaY: -100, preventDefault() {} });
+    assert.deepEqual(wheelClicks, [1]);
+
+    // Connect then disconnect gamepad: disconnect must emit zeroed neutral packet with mask=0
+    rafCb(100);
+    connected = false;
+    rafCb(120);
+    const lastPkt = padPackets[padPackets.length - 1];
+    assert.equal(lastPkt.mask, 0);
+    assert.equal(lastPkt.st.buttons, 0);
+
+    // Opening stream menu must restore TV remote D-pad/Enter navigation
+    mgr.setMenuOpen(true);
+    listeners.get('keydown')({ key: 'ArrowDown', keyCode: 40, preventDefault() {} });
+    listeners.get('keydown')({ key: 'Enter', keyCode: 13, target: { tagName: 'BUTTON' }, preventDefault() {} });
+    assert.deepEqual(navEvents, ['down', 'select']);
+
+    mgr.destroy();
+  } finally {
+    globalThis.window = origWindow;
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, value: origNavigator });
+    globalThis.requestAnimationFrame = origRAF;
+    globalThis.cancelAnimationFrame = origCAF;
+  }
+});
+
 

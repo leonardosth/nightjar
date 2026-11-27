@@ -185,12 +185,17 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
         out_error = "TizenVideoDecoder initialization failed";
         return false;
     }
+
+    audio_decoder_ = std::make_unique<TizenAudioDecoder>();
+    // Add the audio track on the main thread BEFORE opening EMSS (AddTrack requires ReadyState::kClosed)
+    audio_decoder_->open_track_on_main_thread(48000, opts.surround51, decoder_->emss_source());
+    decoder_->open_source();
+
     if (opts.use_video_texture) {
         decoder_->attach_texture_ring(renderer_.video_textures());
         decoder_->register_gl_context();
     }
 
-    audio_decoder_ = std::make_unique<TizenAudioDecoder>();
     return true;
 }
 
@@ -254,14 +259,14 @@ bool NightjarSession::connect_on_worker_thread(std::string& out_error) {
     sc.streamingRemotely = STREAM_CFG_LOCAL;
     sc.audioConfiguration = opts.surround51 ? AUDIO_CONFIGURATION_51_SURROUND : AUDIO_CONFIGURATION_STEREO;
 
+    // Restrict advertised codec to the configured EMSS track codec so the host cannot
+    // negotiate a mismatched codec after ElementaryMediaTrack was already created.
     if (opts.codec == "av1") {
-        sc.supportedVideoFormats = (opts.hdr ? VIDEO_FORMAT_AV1_MAIN10 : 0) |
-            VIDEO_FORMAT_AV1_MAIN8 | VIDEO_FORMAT_H265 | VIDEO_FORMAT_H264;
+        sc.supportedVideoFormats = opts.hdr ? VIDEO_FORMAT_AV1_MAIN10 : VIDEO_FORMAT_AV1_MAIN8;
     } else if (opts.codec == "h264") {
         sc.supportedVideoFormats = VIDEO_FORMAT_H264;
     } else {
-        sc.supportedVideoFormats = (opts.hdr ? VIDEO_FORMAT_H265_MAIN10 : 0) |
-            VIDEO_FORMAT_H265 | VIDEO_FORMAT_H264;
+        sc.supportedVideoFormats = opts.hdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265;
     }
     if (opts.hdr) {
         sc.colorSpace = COLORSPACE_REC_2020;
@@ -425,8 +430,8 @@ int NightjarSession::on_video_decode_unit(
 }
 
 int NightjarSession::on_audio_init(const AudioConfig& cfg) {
-    if (!audio_decoder_ || !decoder_) return 0;
-    return audio_decoder_->initialize(cfg, decoder_->emss_source()) ? 0 : -1;
+    if (!audio_decoder_) return 0;
+    return audio_decoder_->reconfigure_opus(cfg) ? 0 : -1;
 }
 
 void NightjarSession::on_audio_packet(const uint8_t* data, size_t len) {
@@ -504,10 +509,10 @@ void NightjarSession::send_controller_packet(
 #endif
 }
 
-void NightjarSession::send_key(int16_t key_code, uint8_t action, uint8_t modifiers) {
+void NightjarSession::send_key(uint16_t key_code, uint8_t action, uint8_t modifiers) {
     if (!running_.load(std::memory_order_acquire)) return;
 #ifdef NIGHTJAR_HAVE_MOONLIGHT
-    LiSendKeyboardEvent(key_code, static_cast<char>(action), static_cast<char>(modifiers));
+    LiSendKeyboardEvent(static_cast<short>(key_code), static_cast<char>(action), static_cast<char>(modifiers));
 #else
     (void)key_code; (void)action; (void)modifiers;
 #endif
@@ -538,9 +543,10 @@ void NightjarSession::on_display_refresh() {
 
     GLuint display_tex = 0;
     uint32_t frame_number = 0;
-    if (decoder_->poll_next_frame(display_tex, frame_number)) {
+    bool is_tagged = false;
+    if (decoder_->poll_next_frame(display_tex, frame_number, is_tagged)) {
         dec_count_.fetch_add(1u, std::memory_order_relaxed);
-        auto w = opts_.frame_warp_enabled ? warp_->warp(frame_number, t_us) : frame_warp::Warp{};
+        auto w = (opts_.frame_warp_enabled && is_tagged) ? warp_->warp(frame_number, t_us) : frame_warp::Warp{};
         renderer_.sync_hud_mask(*warp_);
         renderer_.draw(display_tex, w, frame_number, warp_->input_seq());
         ren_count_.fetch_add(1u, std::memory_order_relaxed);

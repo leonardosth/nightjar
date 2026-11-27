@@ -114,7 +114,7 @@ struct SslMemIdentity {
 int verify_pinned_server_cert(X509_STORE_CTX* store_ctx, void* arg) {
     auto* pinned_pem = static_cast<const std::string*>(arg);
     if (!pinned_pem || pinned_pem->empty()) {
-        return 1; // Not paired/pinned yet
+        return 0; // Fail closed: mTLS requires a pinned server cert
     }
     X509* peer = X509_STORE_CTX_get0_cert(store_ctx);
     if (!peer) return 0;
@@ -320,12 +320,26 @@ bool HostHttpClient::http_get(
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 
     std::string pinned = use_mtls ? pinned_server_cert(host_ip) : std::string();
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, pinned.empty() ? 0L : 1L);
+    if (use_mtls && pinned.empty()) {
+        out_err = "Missing pinned server certificate for mTLS";
+        curl_easy_cleanup(curl);
+        return false;
+    }
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, use_mtls ? 1L : 0L);
 
     SslMemIdentity mem_id{&identity_.cert_pem, &identity_.key_pem, &pinned};
-    if (use_mtls && !identity_.cert_pem.empty()) {
-        curl_easy_setopt(curl, CURLOPT_SSL_CTX_FUNCTION, ssl_ctx_cb);
-        curl_easy_setopt(curl, CURLOPT_SSL_CTX_DATA, &mem_id);
+    if (use_mtls) {
+        if (identity_.cert_pem.empty() || identity_.key_pem.empty()) {
+            out_err = "Client mTLS identity not initialized";
+            curl_easy_cleanup(curl);
+            return false;
+        }
+        if (curl_easy_setopt(curl, CURLOPT_SSL_CTX_FUNCTION, ssl_ctx_cb) != CURLE_OK ||
+            curl_easy_setopt(curl, CURLOPT_SSL_CTX_DATA, &mem_id) != CURLE_OK) {
+            out_err = "libcurl SSL_CTX_FUNCTION unsupported";
+            curl_easy_cleanup(curl);
+            return false;
+        }
     }
 
     if (abort_flag) {
@@ -340,7 +354,13 @@ bool HostHttpClient::http_get(
         curl_easy_cleanup(curl);
         return false;
     }
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_easy_cleanup(curl);
+    if (http_code >= 400) {
+        out_err = "HTTP error " + std::to_string(http_code);
+        return false;
+    }
     return true;
 #else
     (void)url;
@@ -364,10 +384,17 @@ bool HostHttpClient::unpair(const std::string& host_ip, uint16_t http_port) {
 ServerInfo HostHttpClient::fetch_serverinfo(const std::string& host_ip, uint16_t http_port, uint16_t https_port) {
     ServerInfo info;
     std::string body, err;
-    std::string https_url = "https://" + host_ip + ":" + std::to_string(https_port) +
-                            "/serverinfo?uniqueid=" + identity_.unique_id;
-    bool ok = http_get(https_url, host_ip, true, body, err);
-    if (!ok) {
+    bool ok = false;
+    if (!pinned_server_cert(host_ip).empty()) {
+        std::string https_url = "https://" + host_ip + ":" + std::to_string(https_port) +
+                                "/serverinfo?uniqueid=" + identity_.unique_id;
+        ok = http_get(https_url, host_ip, true, body, err);
+        if (!ok) {
+            // Do not silently downgrade to unauthenticated HTTP when a pinned server cert fails TLS verification
+            info.raw_error = err;
+            return info;
+        }
+    } else {
         std::string http_url = "http://" + host_ip + ":" + std::to_string(http_port) +
                                "/serverinfo?uniqueid=" + identity_.unique_id;
         ok = http_get(http_url, host_ip, false, body, err);
@@ -477,10 +504,17 @@ bool HostHttpClient::pair_with_pin(
     RAND_bytes(client_secret.data(), 16);
 
     BIO* cbio = BIO_new_mem_buf(identity_.cert_pem.data(), static_cast<int>(identity_.cert_pem.size()));
-    X509* client_x509 = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
-    BIO_free(cbio);
+    X509* client_x509 = cbio ? PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr) : nullptr;
+    if (cbio) BIO_free(cbio);
     const ASN1_BIT_STRING* client_sig = nullptr;
-    X509_get0_signature(&client_sig, nullptr, client_x509);
+    if (client_x509) {
+        X509_get0_signature(&client_sig, nullptr, client_x509);
+    }
+    if (!client_x509 || !client_sig || !client_sig->data || client_sig->length <= 0) {
+        if (client_x509) X509_free(client_x509);
+        X509_free(server_x509);
+        return fail_and_unpair("Client X509 identity is missing or invalid");
+    }
 
     std::vector<uint8_t> hash_input;
     hash_input.insert(hash_input.end(), dec_resp.begin() + 32, dec_resp.begin() + 48);
@@ -517,6 +551,10 @@ bool HostHttpClient::pair_with_pin(
     // Verify server_response_hash == SHA256(client_challenge || server_cert_sig || server_secret)
     const ASN1_BIT_STRING* server_sig = nullptr;
     X509_get0_signature(&server_sig, nullptr, server_x509);
+    if (!server_sig || !server_sig->data || server_sig->length <= 0) {
+        X509_free(server_x509);
+        return fail_and_unpair("Server X509 certificate signature missing");
+    }
     std::vector<uint8_t> srv_hash_in;
     srv_hash_in.insert(srv_hash_in.end(), client_challenge.begin(), client_challenge.end());
     srv_hash_in.insert(srv_hash_in.end(), server_sig->data, server_sig->data + server_sig->length);
@@ -545,17 +583,24 @@ bool HostHttpClient::pair_with_pin(
 
     // Step 5: sign client_secret with client private key and send clientpairingsecret
     BIO* kbio = BIO_new_mem_buf(identity_.key_pem.data(), static_cast<int>(identity_.key_pem.size()));
-    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
-    BIO_free(kbio);
+    EVP_PKEY* pkey = kbio ? PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr) : nullptr;
+    if (kbio) BIO_free(kbio);
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
-    EVP_DigestSignInit(mdctx, nullptr, EVP_sha256(), nullptr, pkey);
-    EVP_DigestSignUpdate(mdctx, client_secret.data(), client_secret.size());
     size_t sig_len = 0;
-    EVP_DigestSignFinal(mdctx, nullptr, &sig_len);
-    std::vector<uint8_t> secret_sig(sig_len);
-    EVP_DigestSignFinal(mdctx, secret_sig.data(), &sig_len);
-    EVP_MD_CTX_free(mdctx);
-    EVP_PKEY_free(pkey);
+    std::vector<uint8_t> secret_sig;
+    bool signed_ok = false;
+    if (pkey && mdctx &&
+        EVP_DigestSignInit(mdctx, nullptr, EVP_sha256(), nullptr, pkey) == 1 &&
+        EVP_DigestSignUpdate(mdctx, client_secret.data(), client_secret.size()) == 1 &&
+        EVP_DigestSignFinal(mdctx, nullptr, &sig_len) == 1) {
+        secret_sig.resize(sig_len);
+        signed_ok = (EVP_DigestSignFinal(mdctx, secret_sig.data(), &sig_len) == 1);
+    }
+    if (mdctx) EVP_MD_CTX_free(mdctx);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (!signed_ok) {
+        return fail_and_unpair("Failed to sign client pairing secret");
+    }
 
     std::vector<uint8_t> pairing_secret = client_secret;
     pairing_secret.insert(pairing_secret.end(), secret_sig.begin(), secret_sig.begin() + sig_len);

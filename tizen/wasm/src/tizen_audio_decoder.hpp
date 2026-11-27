@@ -26,8 +26,11 @@ public:
     TizenAudioDecoder();
     ~TizenAudioDecoder();
 
-    // emss_source_ptr is a `samsung::wasm::ElementaryMediaStreamSource*` under TIZEN_WASM_SDK
-    // and may be nullptr in native unit tests.
+    // Main-thread setup: attaches the PCM audio track to EMSS BEFORE source->Open().
+    bool open_track_on_main_thread(int sample_rate, bool surround51, void* emss_source_ptr);
+    // Worker/audio-thread setup: initializes/reconfigures OpusMSDecoder without touching EMSS tracks.
+    bool reconfigure_opus(const AudioConfig& cfg);
+    // Convenience wrapper (used by native unit tests when emss_source_ptr == nullptr).
     bool initialize(const AudioConfig& cfg, void* emss_source_ptr);
     void decode_and_play(const uint8_t* opus_data, size_t opus_len);
     void shutdown();

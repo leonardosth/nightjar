@@ -19,6 +19,7 @@ nightjar::tizen::HostHttpClient g_http;
 nightjar::tizen::WorkerQueue g_worker;
 std::mutex g_session_mutex;
 std::shared_ptr<nightjar::tizen::NightjarSession> g_session;
+std::atomic<bool> g_raf_registered{false};
 std::string g_last_error;
 
 struct AsyncJobResult {
@@ -31,13 +32,23 @@ std::unordered_map<int, AsyncJobResult> g_jobs;
 std::atomic<int> g_next_job_id{1};
 
 std::string json_escape(const std::string& s) {
+    static const char kHex[] = "0123456789abcdef";
     std::string out;
     out.reserve(s.size() + 8);
-    for (char c : s) {
-        if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(c); }
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(static_cast<char>(c)); }
+        else if (c == '\b') out += "\\b";
+        else if (c == '\f') out += "\\f";
         else if (c == '\n') out += "\\n";
         else if (c == '\r') out += "\\r";
-        else out.push_back(c);
+        else if (c == '\t') out += "\\t";
+        else if (c < 0x20) {
+            out += "\\u00";
+            out.push_back(kHex[(c >> 4) & 0xF]);
+            out.push_back(kHex[c & 0xF]);
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
     }
     return out;
 }
@@ -53,6 +64,7 @@ EM_BOOL on_raf(double /*time*/, void* /*user_data*/) {
         s->on_display_refresh();
         return EM_TRUE;
     }
+    g_raf_registered.store(false, std::memory_order_release);
     return EM_FALSE;
 }
 
@@ -147,13 +159,9 @@ int start_async_job(const std::string& op, const std::string& arg1, const std::s
                << ",\"error\":\"" << json_escape(err) << "\"}";
             payload = os.str();
         } else if (op == "stop_stream") {
-            std::shared_ptr<nightjar::tizen::NightjarSession> old;
-            {
-                std::lock_guard<std::mutex> lk(g_session_mutex);
-                old = std::move(g_session);
-            }
-            if (old) {
-                old->stop_network_on_worker();
+            auto s = get_session();
+            if (s) {
+                s->stop_network_on_worker();
             }
             payload = "{\"ok\":true}";
         } else {
@@ -235,14 +243,18 @@ bool prepare_stream_media(
 }
 
 void start_stream_loop() {
-    if (get_session()) {
+    if (get_session() && !g_raf_registered.exchange(true, std::memory_order_acq_rel)) {
         emscripten_request_animation_frame_loop(on_raf, nullptr);
     }
 }
 
 void shutdown_media_on_main_thread() {
-    auto s = get_session();
-    if (s) s->shutdown_media_on_main_thread();
+    std::shared_ptr<nightjar::tizen::NightjarSession> old;
+    {
+        std::lock_guard<std::mutex> lk(g_session_mutex);
+        old = std::move(g_session);
+    }
+    if (old) old->shutdown_media_on_main_thread();
 }
 
 std::string last_error() { return g_last_error; }
@@ -263,7 +275,7 @@ void send_mouse_wheel(int8_t clicks) {
     if (auto s = get_session()) s->send_mouse_wheel(clicks);
 }
 
-void send_key(int16_t key_code, uint8_t action, uint8_t modifiers) {
+void send_key(uint16_t key_code, uint8_t action, uint8_t modifiers) {
     if (auto s = get_session()) s->send_key(key_code, action, modifiers);
 }
 

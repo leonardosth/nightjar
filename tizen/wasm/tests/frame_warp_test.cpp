@@ -171,6 +171,37 @@ int main() {
         tr.mark_filled(*s1, 501u);
         assert(tr.swap_to_display(f, recycle) && f == 501u && recycle == 11u);
         assert(tr.current_display_texture() == 22u);
+
+        // Overwriting an unconsumed ready_ slot must recycle the superseded texture and never leak a slot
+        auto s2 = tr.acquire_for_fill();
+        assert(s2.has_value());
+        std::optional<GLuint> superseded;
+        tr.mark_filled(*s2, 502u, superseded);
+        assert(!superseded.has_value());
+        auto s3 = tr.acquire_for_fill();
+        assert(s3.has_value());
+        tr.mark_filled(*s3, 503u, superseded);
+        assert(superseded.has_value()); // slot s2 was returned to Free and its texture handed back to recycle
+
+        // Generation guard rejects stale in-flight callbacks after reset()
+        uint64_t stale_gen = tr.generation();
+        tr.reset();
+        auto s4 = tr.acquire_for_fill();
+        assert(s4.has_value());
+        tr.mark_filled(*s4, 999u, superseded, stale_gen);
+        assert(!tr.swap_to_display(f, recycle)); // stale callback ignored
+    }
+
+    // 14. TizenAudioDecoder::open_track_on_main_thread and reconfigure_opus are split cleanly
+    {
+        TizenAudioDecoder audio;
+        assert(audio.open_track_on_main_thread(48000, false, nullptr));
+        AudioConfig acfg;
+        acfg.sample_rate = 48000;
+        acfg.channel_count = 2;
+        acfg.samples_per_frame = 240;
+        assert(audio.reconfigure_opus(acfg));
+        audio.shutdown();
     }
 
     // 13. Golden malformed 0x5546 HUD mask RLE rejection (network fuzz edge cases)

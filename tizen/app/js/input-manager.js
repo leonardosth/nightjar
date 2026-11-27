@@ -82,6 +82,7 @@ export class InputManager {
 
     this.streaming = false;
     this.demoMode = false;
+    this.menuOpen = false;
     this.lastNavAt = 0;
     this.lastMenuChord = false;
     this._lastPadCount = -1;
@@ -124,7 +125,7 @@ export class InputManager {
         code === TIZEN_KEY_MENU ||
         code === TIZEN_KEY_YELLOW;
 
-      if (this.streaming) {
+      if (this.streaming && !this.menuOpen) {
         if (isTizenBack || isMenu || (this.demoMode && (key === 'Escape' || key === 'm' || key === 'M'))) {
           ev.preventDefault();
           this.onStreamMenu();
@@ -156,7 +157,17 @@ export class InputManager {
           return;
         }
         ev.preventDefault();
-        this.onBack();
+        if (this.menuOpen) {
+          this.onStreamMenu();
+        } else {
+          this.onBack();
+        }
+        return;
+      }
+
+      if (this.menuOpen && isMenu) {
+        ev.preventDefault();
+        this.onStreamMenu();
         return;
       }
 
@@ -187,7 +198,7 @@ export class InputManager {
     });
 
     window.addEventListener('keyup', (ev) => {
-      if (!this.streaming || this.demoMode || !this.onKeyEvent) return;
+      if (!this.streaming || this.menuOpen || this.demoMode || !this.onKeyEvent) return;
       const code = ev.keyCode | 0;
       if (code > 0 && code < 256) {
         ev.preventDefault();
@@ -196,7 +207,7 @@ export class InputManager {
     });
 
     window.addEventListener('mousemove', (ev) => {
-      if (!this.streaming) return;
+      if (!this.streaming || this.menuOpen) return;
       if (document.pointerLockElement || (ev.buttons & 1) !== 0 || !this.demoMode) {
         const dx = ev.movementX | 0;
         const dy = ev.movementY | 0;
@@ -207,22 +218,23 @@ export class InputManager {
     });
 
     window.addEventListener('mousedown', (ev) => {
-      if (!this.streaming || !this.onMouseButton) return;
+      if (!this.streaming || this.menuOpen || !this.onMouseButton) return;
       const btn = BROWSER_MOUSE_BUTTON[ev.button];
       if (btn) this.onMouseButton(MOUSE_ACTION_PRESS, btn);
     });
 
     window.addEventListener('mouseup', (ev) => {
-      if (!this.streaming || !this.onMouseButton) return;
+      if (!this.streaming || this.menuOpen || !this.onMouseButton) return;
       const btn = BROWSER_MOUSE_BUTTON[ev.button];
       if (btn) this.onMouseButton(MOUSE_ACTION_RELEASE, btn);
     });
 
     window.addEventListener('wheel', (ev) => {
-      if (!this.streaming || !this.onMouseWheel) return;
+      if (!this.streaming || this.menuOpen || !this.onMouseWheel) return;
       if (ev.deltaY !== 0) {
         ev.preventDefault();
-        this.onMouseWheel(-Math.sign(ev.deltaY) * 120);
+        // LiSendScrollEvent multiplies clicks by WHEEL_DELTA (120) internally
+        this.onMouseWheel(-Math.sign(ev.deltaY));
       }
     }, { passive: false });
 
@@ -264,6 +276,15 @@ export class InputManager {
           } else if (!isConnected && (this._arrivedMask & bit) !== 0) {
             this._arrivedMask &= ~bit;
             this._lastSentState[i] = null;
+            this.onControllerPacket?.(i, activeMask, {
+              buttons: 0,
+              leftTrigger: 0,
+              rightTrigger: 0,
+              leftStickX: 0,
+              leftStickY: 0,
+              rightStickX: 0,
+              rightStickY: 0,
+            });
           }
         }
       }
@@ -272,7 +293,7 @@ export class InputManager {
         const pad = rawPads[i];
         if (!pad || pad.connected === false) continue;
 
-        if (this.streaming) {
+        if (this.streaming && !this.menuOpen) {
           const mapped = mapStandardGamepad(pad);
           // Nightjar chord: LB + RB + Start + Back opens stream menu
           const chordMask =
@@ -304,7 +325,11 @@ export class InputManager {
           else if (pad.buttons[14]?.pressed || ax < -0.55 || hatX < -0.5) { this.lastNavAt = now; this.onNavigate('left'); }
           else if (pad.buttons[15]?.pressed || ax > 0.55 || hatX > 0.5) { this.lastNavAt = now; this.onNavigate('right'); }
           else if (pad.buttons[0]?.pressed) { this.lastNavAt = now; this.onNavigate('select'); }
-          else if (pad.buttons[1]?.pressed) { this.lastNavAt = now; this.onBack(); }
+          else if (pad.buttons[1]?.pressed) {
+            this.lastNavAt = now;
+            if (this.menuOpen) this.onStreamMenu();
+            else this.onBack();
+          }
         }
       }
       this._raf = requestAnimationFrame(poll);
@@ -315,9 +340,15 @@ export class InputManager {
   setStreaming(active, { demo = false } = {}) {
     this.streaming = active;
     this.demoMode = active && demo;
+    this.menuOpen = false;
     this.lastMenuChord = false;
     this._arrivedMask = 0;
     this._lastSentState.fill(null);
+  }
+
+  setMenuOpen(open) {
+    this.menuOpen = Boolean(open);
+    this.lastMenuChord = false;
   }
 
   destroy() {

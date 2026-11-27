@@ -54,7 +54,7 @@ function setScreenSaverEnabled(enabled) {
       const state = enabled
         ? window.webapis.appcommon.AppCommonScreenSaverState.SCREEN_SAVER_ON
         : window.webapis.appcommon.AppCommonScreenSaverState.SCREEN_SAVER_OFF;
-      window.webapis.appcommon.setScreenSaver(state, () => {}, () => {});
+      window.webapis.appcommon.setScreenSaver(state, () => { }, () => { });
     }
   } catch {
     // Running outside Tizen TV runtime
@@ -600,7 +600,7 @@ class NightjarTizenApp {
         return;
       }
       host.frameWarpVersion = probe.frameWarpVersion || 0;
-      host.paired = Boolean(probe.paired);
+      host.paired = Boolean(probe.paired) && Boolean(host.serverCertPem);
       if (probe.hostname) host.name = probe.hostname;
       this._saveHosts();
       this._renderHosts();
@@ -692,6 +692,7 @@ class NightjarTizenApp {
 
   toggleStreamMenu(open) {
     this.streamMenuOpen = open;
+    this.input.setMenuOpen(open);
     this.elStreamMenu.classList.toggle('hidden', !open);
     if (open) {
       if (document.pointerLockElement && document.exitPointerLock) {

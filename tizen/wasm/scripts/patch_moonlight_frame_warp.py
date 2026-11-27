@@ -6,6 +6,7 @@ Surgically patches moonlight-common-c to expose Nightjar/Rubylight Frame Warp v1
   - LiSendFrameWarpRequest(ptr,len) (ENet SS_ENC_CONTROL_V2 0x5543 reliable send)
 """
 import pathlib
+import re
 import sys
 
 
@@ -44,8 +45,9 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len);
     if "g_hasFrameWarpControl" not in rtsp_text:
         rtsp_header = (
             '#include "Limelight-internal.h"\n'
-            "static bool g_hasFrameWarpControl = false;\n"
-            "bool LiHasFrameWarpControl(void) { return g_hasFrameWarpControl; }\n"
+            "#include <stdatomic.h>\n"
+            "static atomic_bool g_hasFrameWarpControl = ATOMIC_VAR_INIT(false);\n"
+            "bool LiHasFrameWarpControl(void) { return atomic_load(&g_hasFrameWarpControl); }\n"
             "static bool rlHasFrameWarpControl(const char* sdp) {\n"
             "    if (!sdp) return false;\n"
             "    const char* p = sdp;\n"
@@ -86,16 +88,18 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len);
         rtsp_text = rtsp_text.replace(
             rfi_anchor,
             rfi_anchor
-            + '\n        g_hasFrameWarpControl = rlHasFrameWarpControl(response.payload);',
+            + '\n        atomic_store(&g_hasFrameWarpControl, rlHasFrameWarpControl(response.payload));',
             1,
         )
-        handshake_anchor = "int performRtspHandshake(PSERVER_INFORMATION serverInfo) {"
-        if handshake_anchor in rtsp_text:
-            rtsp_text = rtsp_text.replace(
-                handshake_anchor,
-                handshake_anchor + "\n    g_hasFrameWarpControl = false;",
-                1,
-            )
+        new_rtsp, count = re.subn(
+            r"(int\s+performRtspHandshake\s*\(\s*PSERVER_INFORMATION\s+serverInfo\s*\)\s*\{)",
+            r"\1\n    atomic_store(&g_hasFrameWarpControl, false);",
+            rtsp_text,
+            count=1,
+        )
+        if count != 1:
+            raise RuntimeError("performRtspHandshake anchor not found in RtspConnection.c")
+        rtsp_text = new_rtsp
         rtsp_path.write_text(rtsp_text, encoding="utf-8")
         print(f"Patched {rtsp_path}")
 

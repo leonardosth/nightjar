@@ -162,7 +162,7 @@ export async function probeHostAsync(runtime, address) {
 }
 
 export async function pairHostAsync(runtime, address, pin, { signal = null } = {}) {
-  return runWasmJobAsync(runtime, 'pair', address, pin, '', { timeoutMs: 130000, signal });
+  return runWasmJobAsync(runtime, 'pair', address, pin, '', { timeoutMs: 185000, signal });
 }
 
 export async function cancelPairingAsync(runtime) {
@@ -243,6 +243,9 @@ export class WasmStreamSession {
       );
       if (!conn || !conn.ok) {
         throw new Error((conn && conn.error) || 'Failed to connect stream');
+      }
+      if (this._stopped) {
+        return;
       }
       if (typeof this.runtime.startStreamLoop === 'function') {
         this.runtime.startStreamLoop();
@@ -346,9 +349,7 @@ export class WasmStreamSession {
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
 
-    if (typeof this.runtime.shutdownMedia === 'function') {
-      this.runtime.shutdownMedia();
-    }
+    // Await LiStopConnection() on the worker thread BEFORE tearing down EMSS/WebGL on the main thread
     if (typeof this.runtime.startAsyncJob === 'function' && typeof this.runtime.pollAsyncJob === 'function') {
       try {
         await runWasmJobAsync(this.runtime, 'stop_stream', '', '', '', { timeoutMs: 8000 });
@@ -357,6 +358,10 @@ export class WasmStreamSession {
       }
     } else if (typeof this.runtime.stopStream === 'function') {
       this.runtime.stopStream();
+    }
+
+    if (typeof this.runtime.shutdownMedia === 'function') {
+      this.runtime.shutdownMedia();
     }
 
     const video = typeof document !== 'undefined' ? document.getElementById('tizen-video-sink') : null;
@@ -540,9 +545,9 @@ export class FrameWarpDemoSession {
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(w / 2 - 22, h / 2); ctx.lineTo(w / 2 - 6, h / 2);
-    ctx.moveTo(w / 2 + 6, h / 2);  ctx.lineTo(w / 2 + 22, h / 2);
+    ctx.moveTo(w / 2 + 6, h / 2); ctx.lineTo(w / 2 + 22, h / 2);
     ctx.moveTo(w / 2, h / 2 - 22); ctx.lineTo(w / 2, h / 2 - 6);
-    ctx.moveTo(w / 2, h / 2 + 6);  ctx.lineTo(w / 2, h / 2 + 22);
+    ctx.moveTo(w / 2, h / 2 + 6); ctx.lineTo(w / 2, h / 2 + 22);
     ctx.stroke();
 
     ctx.fillStyle = 'rgba(12, 14, 20, 0.85)';

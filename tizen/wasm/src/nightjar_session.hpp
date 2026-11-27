@@ -81,7 +81,7 @@ public:
         int16_t ly,
         int16_t rx,
         int16_t ry);
-    void send_key(int16_t key_code, uint8_t action, uint8_t modifiers);
+    void send_key(uint16_t key_code, uint8_t action, uint8_t modifiers);
     void set_frame_warp_enabled(bool enabled);
 
     // Called on every TV display refresh (requestAnimationFrame / 60-120 Hz)

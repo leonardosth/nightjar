@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 #ifdef NIGHTJAR_HAVE_OPUS
 #include <opus/opus_multistream.h>
@@ -22,6 +23,7 @@ struct TizenAudioDecoder::Impl
     : public samsung::wasm::ElementaryMediaTrackListener
 #endif
 {
+    std::mutex opus_mu;
 #ifdef NIGHTJAR_HAVE_OPUS
     OpusMSDecoder* decoder = nullptr;
 #endif
@@ -48,17 +50,52 @@ struct TizenAudioDecoder::Impl
 TizenAudioDecoder::TizenAudioDecoder() : impl_(std::make_unique<Impl>()) {}
 TizenAudioDecoder::~TizenAudioDecoder() { shutdown(); }
 
-bool TizenAudioDecoder::initialize(const AudioConfig& cfg, void* emss_source_ptr) {
-    shutdown();
-    cfg_ = cfg;
+bool TizenAudioDecoder::open_track_on_main_thread(int sample_rate, bool surround51, void* emss_source_ptr) {
+    if (sample_rate <= 0) return false;
+    cfg_.sample_rate = sample_rate;
+    cfg_.channel_count = surround51 ? 6 : 2;
     samples_submitted_.store(0, std::memory_order_release);
-    if (cfg_.sample_rate <= 0 || cfg_.channel_count <= 0 || cfg_.samples_per_frame <= 0) {
+
+#if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
+    if (emss_source_ptr != nullptr) {
+        auto* source = static_cast<samsung::wasm::ElementaryMediaStreamSource*>(emss_source_ptr);
+        samsung::wasm::ElementaryAudioTrackConfig track_cfg;
+        track_cfg.mime_type = "audio/webm; codecs=\"pcm\"";
+        track_cfg.extradata = {};
+        track_cfg.sample_format = samsung::wasm::SampleFormat::kS16;
+        track_cfg.channel_layout = surround51
+            ? samsung::wasm::ChannelLayout::k5_1
+            : samsung::wasm::ChannelLayout::kStereo;
+        track_cfg.samples_per_second = static_cast<uint32_t>(sample_rate);
+
+        auto add_res = source->AddTrack(track_cfg);
+        if (!add_res) {
+            return false;
+        }
+        impl_->audio_track = std::move(add_res.value);
+        impl_->audio_track.SetListener(impl_.get());
+        impl_->has_track = true;
+    }
+#else
+    (void)emss_source_ptr;
+#endif
+    return true;
+}
+
+bool TizenAudioDecoder::reconfigure_opus(const AudioConfig& cfg) {
+    if (cfg.sample_rate <= 0 || cfg.channel_count <= 0 || cfg.samples_per_frame <= 0) {
         return false;
     }
-
+    std::lock_guard<std::mutex> lk(impl_->opus_mu);
+    cfg_ = cfg;
+    samples_submitted_.store(0, std::memory_order_release);
     pcm_buf_.assign(static_cast<size_t>(cfg_.samples_per_frame) * static_cast<size_t>(cfg_.channel_count), 0);
 
 #ifdef NIGHTJAR_HAVE_OPUS
+    if (impl_->decoder) {
+        opus_multistream_decoder_destroy(impl_->decoder);
+        impl_->decoder = nullptr;
+    }
     int opus_err = OPUS_OK;
     impl_->decoder = opus_multistream_decoder_create(
         cfg_.sample_rate,
@@ -72,37 +109,28 @@ bool TizenAudioDecoder::initialize(const AudioConfig& cfg, void* emss_source_ptr
         return false;
     }
 #endif
-
-#if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
-    if (emss_source_ptr != nullptr) {
-        auto* source = static_cast<samsung::wasm::ElementaryMediaStreamSource*>(emss_source_ptr);
-        samsung::wasm::ElementaryAudioTrackConfig track_cfg;
-        track_cfg.mime_type = "audio/webm; codecs=\"pcm\"";
-        track_cfg.extradata = {};
-        track_cfg.sample_format = samsung::wasm::SampleFormat::kS16;
-        track_cfg.channel_layout = (cfg_.channel_count >= 6)
-            ? samsung::wasm::ChannelLayout::k5_1
-            : samsung::wasm::ChannelLayout::kStereo;
-        track_cfg.samples_per_second = static_cast<uint32_t>(cfg_.sample_rate);
-
-        auto add_res = source->AddTrack(track_cfg);
-        if (add_res) {
-            impl_->audio_track = std::move(add_res.value);
-            impl_->audio_track.SetListener(impl_.get());
-            impl_->has_track = true;
-        }
-    }
-#else
-    (void)emss_source_ptr;
-#endif
-
     initialized_ = true;
     return true;
+}
+
+bool TizenAudioDecoder::initialize(const AudioConfig& cfg, void* emss_source_ptr) {
+    shutdown();
+    if (!open_track_on_main_thread(cfg.sample_rate, cfg.channel_count >= 6, emss_source_ptr)) {
+        return false;
+    }
+    return reconfigure_opus(cfg);
 }
 
 void TizenAudioDecoder::decode_and_play(const uint8_t* opus_data, size_t opus_len) {
     if (!initialized_ || !opus_data || opus_len == 0) return;
 
+#if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
+    if (!impl_->has_track || !impl_->track_open.load(std::memory_order_acquire)) {
+        return;
+    }
+#endif
+
+    std::lock_guard<std::mutex> lk(impl_->opus_mu);
     int decoded_samples = cfg_.samples_per_frame;
 #ifdef NIGHTJAR_HAVE_OPUS
     if (!impl_->decoder) return;
@@ -121,9 +149,6 @@ void TizenAudioDecoder::decode_and_play(const uint8_t* opus_data, size_t opus_le
         std::memory_order_acq_rel);
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
-    if (!impl_->has_track || !impl_->track_open.load(std::memory_order_acquire)) {
-        return;
-    }
     const double sr = static_cast<double>(cfg_.sample_rate);
     samsung::wasm::Seconds pts(static_cast<double>(prev_samples) / sr);
     samsung::wasm::Seconds dur(static_cast<double>(decoded_samples) / sr);
@@ -151,14 +176,17 @@ void TizenAudioDecoder::decode_and_play(const uint8_t* opus_data, size_t opus_le
 
 void TizenAudioDecoder::shutdown() {
     initialized_ = false;
+    if (!impl_) return;
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
-    if (impl_) {
-        impl_->track_open.store(false, std::memory_order_release);
-        impl_->has_track = false;
+    if (impl_->has_track) {
+        impl_->audio_track.SetListener(nullptr);
     }
+    impl_->track_open.store(false, std::memory_order_release);
+    impl_->has_track = false;
 #endif
+    std::lock_guard<std::mutex> lk(impl_->opus_mu);
 #ifdef NIGHTJAR_HAVE_OPUS
-    if (impl_ && impl_->decoder) {
+    if (impl_->decoder) {
         opus_multistream_decoder_destroy(impl_->decoder);
         impl_->decoder = nullptr;
     }

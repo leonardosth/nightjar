@@ -13,11 +13,15 @@ import {
 import { InputManager, TIZEN_KEY_BACK } from '../app/js/input-manager.js';
 import {
   MOONLIGHT_BUTTONS,
+  NavRepeat,
+  assignControllerSlots,
   mapStandardGamepad,
   computeActiveGamepadMask,
   shouldSendGamepadState,
   pickSpatialFocus,
 } from '../app/js/gamepad-mapping.js';
+import { formatLatency, fwStateKey, buildOverlayRows } from '../app/js/stream-stats.js';
+import { initialFocusKey, launchDecision } from '../app/js/home-model.js';
 import {
   STRINGS,
   resolveLocale,
@@ -613,6 +617,162 @@ test('patch_moonlight_frame_warp.py applies Frame Warp v1 and Samsung Tizen Sock
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
+});
+
+test('assignControllerSlots compacts W3C indices into lowest free Moonlight slots and reuses freed slots', () => {
+  const r1 = assignControllerSlots(new Map(), [null, { connected: true }]);
+  assert.equal(r1.slots.get(1), 0);
+  assert.equal(r1.mask, 0b1);
+  assert.deepEqual(r1.arrived, [{ pad: 1, slot: 0 }]);
+
+  const r2 = assignControllerSlots(r1.slots, [null, { connected: true }, { connected: true }]);
+  assert.equal(r2.slots.get(1), 0);
+  assert.equal(r2.slots.get(2), 1);
+  assert.equal(r2.mask, 0b11);
+  assert.deepEqual(r2.arrived, [{ pad: 2, slot: 1 }]);
+
+  const r3 = assignControllerSlots(r2.slots, [null, null, { connected: true }]);
+  assert.equal(r3.slots.has(1), false);
+  assert.equal(r3.slots.get(2), 1);
+  assert.equal(r3.mask, 0b10);
+  assert.deepEqual(r3.removed, [{ pad: 1, slot: 0 }]);
+
+  const r4 = assignControllerSlots(r3.slots, [{ connected: true }, null, { connected: true }]);
+  assert.equal(r4.slots.get(0), 0);
+  assert.equal(r4.slots.get(2), 1);
+  assert.equal(r4.mask, 0b11);
+  assert.deepEqual(r4.arrived, [{ pad: 0, slot: 0 }]);
+});
+
+test('NavRepeat fires on press edge, waits initialDelayMs, then repeats at repeatMs', () => {
+  const nr = new NavRepeat({ initialDelayMs: 400, repeatMs: 140 });
+  assert.equal(nr.update('down', 100), 'down');
+  assert.equal(nr.update('down', 300), null);
+  assert.equal(nr.update('down', 499), null);
+  assert.equal(nr.update('down', 500), 'down');
+  assert.equal(nr.update('down', 600), null);
+  assert.equal(nr.update('down', 640), 'down');
+  assert.equal(nr.update(null, 650), null);
+  assert.equal(nr.update('up', 660), 'up');
+});
+
+test('InputManager edge-triggers A/B, ignores repeat Enter, and compacts streaming controller slot', () => {
+  const origWindow = globalThis.window;
+  const origNavigator = globalThis.navigator;
+  const origRAF = globalThis.requestAnimationFrame;
+  const origCAF = globalThis.cancelAnimationFrame;
+
+  const listeners = new Map();
+  let rafCb = null;
+  const pad0 = {
+    id: 'Pad',
+    mapping: 'standard',
+    connected: true,
+    axes: [0, 0, 0, 0],
+    buttons: Array.from({ length: 16 }, () => ({ pressed: false, value: 0 })),
+  };
+  let pads = [pad0];
+
+  try {
+    globalThis.window = {
+      addEventListener(type, fn) { listeners.set(type, fn); },
+    };
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { getGamepads: () => pads },
+    });
+    globalThis.requestAnimationFrame = (cb) => { rafCb = cb; return 1; };
+    globalThis.cancelAnimationFrame = () => {};
+
+    const navEvents = [];
+    let backCount = 0;
+    const packets = [];
+
+    const mgr = new InputManager({
+      onNavigate: (d) => navEvents.push(d),
+      onBack: () => { backCount++; },
+      onStreamMenu: () => {},
+      onMouseMove: () => {},
+      onControllerPacket: (idx, mask, st) => packets.push({ idx, mask, st }),
+      onGamepadStatus: () => {},
+    });
+
+    // Holding A across 5 rAF ticks (~16 ms apart) yields exactly one 'select'
+    pad0.buttons[0].pressed = true;
+    for (let t = 100; t <= 164; t += 16) rafCb(t);
+    assert.deepEqual(navEvents, ['select']);
+
+    // Holding B across multiple ticks yields exactly one back
+    pad0.buttons[0].pressed = false;
+    pad0.buttons[1].pressed = true;
+    for (let t = 180; t <= 244; t += 16) rafCb(t);
+    assert.equal(backCount, 1);
+
+    // keydown Enter with repeat: true is ignored
+    listeners.get('keydown')({ key: 'Enter', keyCode: 13, repeat: true, target: { tagName: 'BUTTON' }, preventDefault() {} });
+    assert.deepEqual(navEvents, ['select']);
+
+    // While streaming, a pad only at W3C index 2 sends onControllerPacket with idx 0
+    pad0.buttons[1].pressed = false;
+    pads = [null, null, {
+      id: 'Pad at 2',
+      mapping: 'standard',
+      connected: true,
+      axes: [0, 0, 0, 0],
+      buttons: Array.from({ length: 16 }, () => ({ pressed: false, value: 0 })),
+    }];
+    mgr.setStreaming(true);
+    rafCb(300);
+    assert.equal(packets.length > 0, true);
+    assert.equal(packets[0].idx, 0);
+    assert.equal(packets[0].mask, 1);
+
+    mgr.destroy();
+  } finally {
+    globalThis.window = origWindow;
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, value: origNavigator });
+    globalThis.requestAnimationFrame = origRAF;
+    globalThis.cancelAnimationFrame = origCAF;
+  }
+});
+
+test('formatLatency and buildOverlayRows format latency stats, Frame Warp states, and missing fields cleanly', () => {
+  assert.equal(formatLatency(null), '—');
+  assert.equal(formatLatency({ n: 0, min: 1, avg: 2, max: 3 }), '—');
+  assert.equal(formatLatency({ n: 5, min: 1.04, avg: 2.04, max: 3.04 }), '1.0 / 2.0 / 3.0 ms');
+
+  const rows = buildOverlayRows(
+    {
+      session: 'PC (4K)',
+      hostLat: { n: 10, min: 1, avg: 2, max: 3 },
+      fwState: 'rtsp-no-fw',
+    },
+    (k) => k
+  );
+  const hostRow = rows.find((r) => r.key === 'hostLat');
+  const fwRow = rows.find((r) => r.key === 'fw');
+  const decRow = rows.find((r) => r.key === 'decLat');
+  assert.equal(hostRow.value, '1.0 / 2.0 / 3.0 ms');
+  assert.equal(fwRow.value, 'ov.fw.rtsp-no-fw');
+  assert.equal(fwStateKey({ fwState: 'rtsp-no-fw' }), 'ov.fw.rtsp-no-fw');
+  assert.equal(decRow.value, '—');
+
+  const emptyRows = buildOverlayRows({}, (k) => k);
+  assert.equal(emptyRows.find((r) => r.key === 'hostLat').value, '—');
+  assert.equal(emptyRows.find((r) => r.key === 'presentLat').value, '—');
+  assert.equal(emptyRows.find((r) => r.key === 'net').value, '—');
+});
+
+test('initialFocusKey and launchDecision cover all launcher focus and launch states', () => {
+  assert.equal(initialFocusKey({ lastPlayedVisible: true, selectedHostId: 'h1', hosts: [{ id: 'h1' }] }), 'continue');
+  assert.equal(initialFocusKey({ lastPlayedVisible: false, selectedHostId: 'h2', hosts: [{ id: 'h1' }, { id: 'h2' }] }), 'host:h2');
+  assert.equal(initialFocusKey({ lastPlayedVisible: false, selectedHostId: '', hosts: [{ id: 'h1' }] }), 'host:h1');
+  assert.equal(initialFocusKey({ lastPlayedVisible: false, selectedHostId: '', hosts: [] }), 'add-host');
+
+  assert.equal(launchDecision({ paired: false, currentGame: 0 }, 101), 'pair');
+  assert.equal(launchDecision({ paired: true, currentGame: 101 }, 101), 'resume');
+  assert.equal(launchDecision({ paired: true, currentGame: 202 }, 101), 'confirm-quit');
+  assert.equal(launchDecision({ paired: true, currentGame: 0 }, 101), 'launch');
 });
 
 

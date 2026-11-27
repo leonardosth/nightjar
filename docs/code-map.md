@@ -85,9 +85,9 @@ Native code beside the engines, in `app/src/main/jni/`: `pyrowave-renderer/`, `v
 
 | Part | Where (`tizen/`) |
 | --- | --- |
-| TV UI, i18n, input | `app/index.html`, `app/css/nightjar-tv.css`, `app/js/app.js`, `app/js/i18n.js`, `app/js/input-manager.js`, `app/js/gamepad-mapping.js` |
+| TV UI, i18n, input | `app/index.html`, `app/css/nightjar-tv.css`, `app/js/app.js`, `app/js/home-model.js`, `app/js/stream-stats.js`, `app/js/i18n.js`, `app/js/input-manager.js`, `app/js/gamepad-mapping.js` |
 | WASM bridge & offline lab | `app/js/wasm-bridge.js`, `app/js/frame-warp.js`, `app/js/warp-renderer.js` |
-| C++17 WASM engine | `wasm/src/main.cpp` (`WorkerQueue`), `host_http_client.{hpp,cpp}`, `codec_capabilities.{hpp,cpp}`, `nightjar_session.{hpp,cpp}`, `tizen_video_decoder.{hpp,cpp}` (`TextureRing`), `tizen_audio_decoder.{hpp,cpp}`, `warp_gl_renderer.{hpp,cpp}`, `frame_warp_{protocol,predictor}.{hpp,cpp}` |
+| C++17 WASM engine | `wasm/src/main.cpp` (`WorkerQueue`), `stream_telemetry.hpp` (`LatencyWindow`, `PendingFrameQueue`), `host_http_client.{hpp,cpp}`, `codec_capabilities.{hpp,cpp}`, `nightjar_session.{hpp,cpp}`, `tizen_video_decoder.{hpp,cpp}` (`TextureRing`), `tizen_audio_decoder.{hpp,cpp}`, `warp_gl_renderer.{hpp,cpp}`, `frame_warp_{protocol,predictor}.{hpp,cpp}` |
 | Build & packaging | `Dockerfile`, `wasm/CMakeLists.txt`, `wasm/scripts/patch_moonlight_frame_warp.py`, `build-wgt.ps1`, `.github/workflows/tizen.yml` |
 
 ## Checklists

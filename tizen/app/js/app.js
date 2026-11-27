@@ -6,6 +6,13 @@ import { WarpRenderer } from './warp-renderer.js';
 import { InputManager } from './input-manager.js';
 import { pickSpatialFocus } from './gamepad-mapping.js';
 import { resolveLocale, tr, migrateSettings } from './i18n.js';
+import { buildOverlayRows } from './stream-stats.js';
+import {
+  initialFocusKey,
+  launchDecision,
+  loadHomeState,
+  saveHomeState,
+} from './home-model.js';
 import {
   detectWasmEngine,
   probeHostAsync,
@@ -66,23 +73,29 @@ class NightjarTizenApp {
     this.locale = resolveLocale(typeof navigator !== 'undefined' ? navigator.language : 'en');
     this.hosts = loadHosts();
     this.settings = loadSettings();
+    this.homeState = loadHomeState(typeof localStorage !== 'undefined' ? localStorage : null);
+    this.selectedHostId = this.hosts.some((h) => h.id === this.homeState.lastHostId)
+      ? this.homeState.lastHostId
+      : (this.hosts[0]?.id || '');
     this.wasm = { available: false, runtime: null };
     this.activeTab = 'hosts';
     this.renderer = null;
     this.session = null;
     this.streamMenuOpen = false;
     this.focusedEl = null;
-    this._selectedHostForApps = null;
-    this._runningAppId = 0;
+    this._focusStack = [];
+    this._busy = false;
+    this._userNavigated = false;
+    this._ovRowMap = new Map();
 
     this._bindElements();
     this._applyLocale();
     this._syncSettingsToDom();
-    this._renderHosts();
+    this._renderHome();
     this._initInput();
     this._bindLifecycle();
+    this._focusInitial();
     this._detectWasm();
-    this._focusFirst();
   }
 
   t(key, vars = {}) {
@@ -100,43 +113,28 @@ class NightjarTizenApp {
     this.elStream = document.getElementById('stream-view');
     this.elCanvas = document.getElementById('stream-canvas');
     this.elDemoCanvas = document.getElementById('demo-canvas');
-    this.elHostsGrid = document.getElementById('hosts-grid');
+    this.elContinueSection = document.getElementById('continue-section');
+    this.elBtnContinue = document.getElementById('btn-continue');
+    this.elHostsRow = document.getElementById('hosts-row');
+    this.elAppsSection = document.getElementById('apps-section');
+    this.elAppsHeading = document.getElementById('apps-heading');
+    this.elAppsRow = document.getElementById('apps-row');
     this.elWasmPill = document.getElementById('wasm-status-pill');
     this.elPadPill = document.getElementById('gamepad-status-pill');
     this.elAddModal = document.getElementById('add-host-modal');
-    this.elAppsModal = document.getElementById('app-list-modal');
-    this.elAppsGrid = document.getElementById('apps-grid');
     this.elDialogModal = document.getElementById('tv-dialog-modal');
     this.elStreamMenu = document.getElementById('stream-menu');
     this.elOverlay = document.getElementById('stream-overlay');
+    this.elOvRows = document.getElementById('ov-rows');
 
     document.querySelectorAll('.nav-tab').forEach((btn) => {
       btn.addEventListener('click', () => this.switchTab(btn.dataset.tab));
     });
 
-    document.getElementById('btn-add-host').addEventListener('click', () => this.openAddHostModal());
-    document.getElementById('btn-launch-demo').addEventListener('click', () => this.startDemoStream());
+    this.elBtnContinue.addEventListener('click', () => this.continueLastPlayed());
     document.getElementById('btn-lab-start').addEventListener('click', () => this.startDemoStream());
     document.getElementById('btn-modal-cancel').addEventListener('click', () => this.closeAddHostModal());
     document.getElementById('btn-modal-save').addEventListener('click', () => this.saveNewHost());
-    document.getElementById('btn-apps-close').addEventListener('click', () => this.closeAppsModal());
-
-    document.getElementById('btn-resume-running').addEventListener('click', () => {
-      if (this._selectedHostForApps && this._runningAppId) {
-        const host = this._selectedHostForApps;
-        const appId = this._runningAppId;
-        this.closeAppsModal();
-        this._launchStream(host, appId, true);
-      }
-    });
-
-    document.getElementById('btn-quit-running').addEventListener('click', async () => {
-      if (!this._selectedHostForApps || !this.wasm.available) return;
-      await cancelHostAppAsync(this.wasm.runtime, this._selectedHostForApps.address);
-      this._runningAppId = 0;
-      document.getElementById('btn-resume-running').classList.add('hidden');
-      document.getElementById('btn-quit-running').classList.add('hidden');
-    });
 
     document.getElementById('btn-sm-toggle-fw').addEventListener('click', () => {
       this.settings.fwEnabled = !this.settings.fwEnabled;
@@ -206,10 +204,24 @@ class NightjarTizenApp {
 
   _saveHosts() {
     try {
-      localStorage.setItem(STORAGE_HOSTS, JSON.stringify(this.hosts));
+      const clean = this.hosts.map((h) => ({
+        id: h.id,
+        name: h.name,
+        address: h.address,
+        frameWarpVersion: h.frameWarpVersion || 0,
+        paired: Boolean(h.paired),
+        serverCertPem: h.serverCertPem || '',
+        currentGame: h.currentGame || 0,
+        apps: Array.isArray(h.apps) ? h.apps : [],
+      }));
+      localStorage.setItem(STORAGE_HOSTS, JSON.stringify(clean));
     } catch {
       // ignore
     }
+  }
+
+  _saveHomeState() {
+    saveHomeState(typeof localStorage !== 'undefined' ? localStorage : null, this.homeState);
   }
 
   async _detectWasm() {
@@ -217,7 +229,6 @@ class NightjarTizenApp {
     if (this.wasm.available) {
       this.elWasmPill.textContent = this.t('pill.wasmReady');
       this.elWasmPill.className = 'pill pill-ok';
-      // Restore pinned server certificates into WASM client
       if (typeof this.wasm.runtime.setPinnedCert === 'function') {
         for (const h of this.hosts) {
           if (h.serverCertPem) {
@@ -225,6 +236,7 @@ class NightjarTizenApp {
           }
         }
       }
+      this._refreshHostsInBackground();
     } else {
       this.elWasmPill.textContent = this.t('pill.wasmMissing');
       this.elWasmPill.className = 'pill pill-warn';
@@ -277,15 +289,31 @@ class NightjarTizenApp {
     });
   }
 
+  _hasOpenModal() {
+    return (
+      (this.elDialogModal && !this.elDialogModal.classList.contains('hidden')) ||
+      !this.elAddModal.classList.contains('hidden') ||
+      !this.elStreamMenu.classList.contains('hidden')
+    );
+  }
+
   _visibleFocusables() {
     let root = this.elLauncher;
     if (this.elDialogModal && !this.elDialogModal.classList.contains('hidden')) root = this.elDialogModal;
-    else if (this.elAppsModal && !this.elAppsModal.classList.contains('hidden')) root = this.elAppsModal;
     else if (!this.elAddModal.classList.contains('hidden')) root = this.elAddModal;
     else if (!this.elStreamMenu.classList.contains('hidden')) root = this.elStreamMenu;
     return Array.from(root.querySelectorAll('.focusable')).filter(
       (el) => el.offsetParent !== null && !el.classList.contains('hidden')
     );
+  }
+
+  _focusKeyOf(el) {
+    return el && el.dataset ? (el.dataset.focusKey || '') : '';
+  }
+
+  _findFocusableByKey(key) {
+    if (!key) return null;
+    return this._visibleFocusables().find((el) => this._focusKeyOf(el) === key) || null;
   }
 
   _setFocus(el) {
@@ -297,10 +325,35 @@ class NightjarTizenApp {
     el.classList.add('focused');
     try {
       el.focus({ preventScroll: true });
-      if (el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+      if (el.scrollIntoView) el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     } catch {
       el.focus();
     }
+  }
+
+  _pushFocus() {
+    this._focusStack.push({
+      el: this.focusedEl,
+      key: this._focusKeyOf(this.focusedEl),
+    });
+  }
+
+  _popFocus() {
+    const saved = this._focusStack.pop();
+    if (saved) {
+      if (saved.el && saved.el.isConnected && saved.el.offsetParent !== null) {
+        this._setFocus(saved.el);
+        return;
+      }
+      if (saved.key) {
+        const match = this._findFocusableByKey(saved.key);
+        if (match) {
+          this._setFocus(match);
+          return;
+        }
+      }
+    }
+    this._focusInitial();
   }
 
   _focusFirst() {
@@ -308,7 +361,28 @@ class NightjarTizenApp {
     if (items.length > 0) this._setFocus(items[0]);
   }
 
+  _focusInitial() {
+    if (this._hasOpenModal() || this.activeTab !== 'hosts') {
+      const root = document.getElementById(`tab-${this.activeTab}`);
+      const firstInTab = root
+        ? Array.from(root.querySelectorAll('.focusable')).find((el) => el.offsetParent !== null)
+        : null;
+      if (firstInTab) this._setFocus(firstInTab);
+      else this._focusFirst();
+      return;
+    }
+    const lastPlayedVisible = !this.elContinueSection.classList.contains('hidden');
+    const key = initialFocusKey({
+      lastPlayedVisible,
+      selectedHostId: this.selectedHostId,
+      hosts: this.hosts,
+    });
+    const target = this._findFocusableByKey(key) || this._visibleFocusables().find((el) => !el.classList.contains('nav-tab'));
+    if (target) this._setFocus(target);
+  }
+
   _handleNavigation(dir) {
+    this._userNavigated = true;
     const items = this._visibleFocusables();
     if (items.length === 0) return;
     let current = document.activeElement;
@@ -316,6 +390,19 @@ class NightjarTizenApp {
       current = this.focusedEl;
     }
     const idx = items.indexOf(current);
+
+    if ((dir === 'left' || dir === 'right') && current && current.tagName === 'LABEL') {
+      const sel = current.querySelector('select');
+      if (sel && sel.options.length > 0) {
+        const delta = dir === 'right' ? 1 : -1;
+        const nextOpt = Math.max(0, Math.min(sel.options.length - 1, sel.selectedIndex + delta));
+        if (nextOpt !== sel.selectedIndex) {
+          sel.selectedIndex = nextOpt;
+          sel.dispatchEvent(new Event('change'));
+        }
+        return;
+      }
+    }
 
     if (dir === 'select') {
       const target = idx >= 0 ? items[idx] : items[0];
@@ -336,12 +423,16 @@ class NightjarTizenApp {
     }
 
     if (idx < 0) {
-      this._setFocus(items[0]);
+      this._focusInitial();
       return;
     }
     const rects = items.map((el) => el.getBoundingClientRect());
     const nextIdx = pickSpatialFocus(rects, idx, dir);
-    this._setFocus(items[nextIdx >= 0 ? nextIdx : idx]);
+    const nextEl = items[nextIdx >= 0 ? nextIdx : idx];
+    this._setFocus(nextEl);
+    if (nextEl && nextEl.classList.contains('nav-tab') && nextEl.dataset.tab !== this.activeTab) {
+      this.switchTab(nextEl.dataset.tab, { keepFocus: true });
+    }
   }
 
   _handleBack() {
@@ -351,13 +442,16 @@ class NightjarTizenApp {
       else document.getElementById('btn-dialog-ok').click();
       return;
     }
-    if (this.elAppsModal && !this.elAppsModal.classList.contains('hidden')) {
-      this.closeAppsModal();
-      return;
-    }
     if (!this.elAddModal.classList.contains('hidden')) {
       this.closeAddHostModal();
       return;
+    }
+    if (this.activeTab === 'hosts' && this.focusedEl && this.focusedEl.closest && this.focusedEl.closest('#apps-row')) {
+      const hostBtn = this._findFocusableByKey(`host:${this.selectedHostId}`);
+      if (hostBtn) {
+        this._setFocus(hostBtn);
+        return;
+      }
     }
     if (this.activeTab !== 'hosts') {
       this.switchTab('hosts');
@@ -372,7 +466,7 @@ class NightjarTizenApp {
     }
   }
 
-  switchTab(tab) {
+  switchTab(tab, { keepFocus = false } = {}) {
     this.activeTab = tab;
     document.querySelectorAll('.nav-tab').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.tab === tab);
@@ -380,23 +474,51 @@ class NightjarTizenApp {
     document.querySelectorAll('.tab-panel').forEach((panel) => {
       panel.classList.toggle('active', panel.id === `tab-${tab}`);
     });
-    this._focusFirst();
+    if (!keepFocus) {
+      this._focusInitial();
+    }
+  }
+
+  _renderHome({ focusKey = null } = {}) {
+    const prevKey = focusKey || this._focusKeyOf(this.focusedEl);
+    this._renderContinue();
+    this._renderHosts();
+    this._renderApps();
+
+    if (!this.session && !this._hasOpenModal() && this.activeTab === 'hosts') {
+      const target = (prevKey && this._findFocusableByKey(prevKey)) || null;
+      if (target) {
+        this._setFocus(target);
+      } else if (!this.focusedEl || !this.focusedEl.isConnected || this.focusedEl.offsetParent === null) {
+        this._focusInitial();
+      }
+    }
+  }
+
+  _renderContinue() {
+    const lp = this.homeState.lastPlayed;
+    const host = lp ? this.hosts.find((h) => h.id === lp.hostId) : null;
+    if (!lp || !host) {
+      this.elContinueSection.classList.add('hidden');
+      return;
+    }
+    this.elContinueSection.classList.remove('hidden');
+    const isRunning = host.currentGame && host.currentGame === lp.appId;
+    document.getElementById('continue-kicker').textContent = isRunning
+      ? this.t('continue.resume')
+      : this.t('continue.play');
+    document.getElementById('continue-title').textContent = lp.appTitle || `#${lp.appId}`;
+    document.getElementById('continue-sub').textContent = this.t('continue.on', { host: host.name });
   }
 
   _renderHosts() {
-    this.elHostsGrid.textContent = '';
-    if (this.hosts.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty-state';
-      empty.textContent = this.t('hosts.empty');
-      this.elHostsGrid.appendChild(empty);
-      return;
-    }
+    this.elHostsRow.textContent = '';
 
     for (const host of this.hosts) {
       const card = document.createElement('button');
-      card.className = 'host-card focusable';
+      card.className = host.busy ? 'host-card focusable busy' : 'host-card focusable';
       card.dataset.hostId = host.id;
+      card.dataset.focusKey = `host:${host.id}`;
 
       const title = document.createElement('h4');
       title.textContent = host.name;
@@ -408,24 +530,115 @@ class NightjarTizenApp {
       const tags = document.createElement('div');
       tags.className = 'host-tags';
 
-      const fwTag = document.createElement('span');
-      fwTag.className = host.frameWarpVersion ? 'tag tag-fw' : 'tag';
-      fwTag.textContent = host.frameWarpVersion
-        ? this.t('hosts.fwSupported', { ver: host.frameWarpVersion })
-        : this.t('hosts.standard');
+      const statusTag = document.createElement('span');
+      if (host.busy) {
+        statusTag.className = 'tag tag-fw';
+        statusTag.textContent = host.busyText || this.t('hosts.connecting');
+      } else if (host.online === true) {
+        statusTag.className = 'tag tag-ok';
+        statusTag.textContent = this.t('hosts.online');
+      } else if (host.online === false) {
+        statusTag.className = 'tag tag-err';
+        statusTag.textContent = this.t('hosts.offline');
+      } else {
+        statusTag.className = 'tag';
+        statusTag.textContent = host.paired ? this.t('hosts.paired') : this.t('hosts.unpaired');
+      }
+      tags.appendChild(statusTag);
 
-      const pairTag = document.createElement('span');
-      pairTag.className = 'tag';
-      pairTag.textContent = host.paired ? this.t('hosts.paired') : this.t('hosts.unpaired');
+      if (host.frameWarpVersion) {
+        const fwTag = document.createElement('span');
+        fwTag.className = 'tag tag-fw';
+        fwTag.textContent = this.t('hosts.fwSupported', { ver: host.frameWarpVersion });
+        tags.appendChild(fwTag);
+      }
 
-      tags.appendChild(fwTag);
-      tags.appendChild(pairTag);
+      if (host.currentGame) {
+        const runTag = document.createElement('span');
+        runTag.className = 'tag tag-fw';
+        runTag.textContent = this.t('hosts.running');
+        tags.appendChild(runTag);
+      }
+
       card.appendChild(title);
       card.appendChild(meta);
       card.appendChild(tags);
+      card.addEventListener('click', () => this.selectHost(host));
+      this.elHostsRow.appendChild(card);
+    }
 
-      card.addEventListener('click', () => this.connectHost(host));
-      this.elHostsGrid.appendChild(card);
+    const addCard = document.createElement('button');
+    addCard.className = 'host-card add-card focusable';
+    addCard.dataset.focusKey = 'add-host';
+    addCard.textContent = this.t('hosts.addCard');
+    addCard.addEventListener('click', () => this.openAddHostModal());
+    this.elHostsRow.appendChild(addCard);
+  }
+
+  _renderApps() {
+    const host = this.hosts.find((h) => h.id === this.selectedHostId);
+    const hasApps = host && Array.isArray(host.apps) && host.apps.length > 0;
+    if (!host || (!host.paired && !hasApps && !host.appsLoading)) {
+      this.elAppsSection.classList.add('hidden');
+      this.elAppsRow.textContent = '';
+      return;
+    }
+
+    this.elAppsSection.classList.remove('hidden');
+    this.elAppsHeading.textContent = `${this.t('apps.heading')} — ${host.name}`;
+    this.elAppsRow.textContent = '';
+
+    if (host.appsLoading) {
+      const loading = document.createElement('div');
+      loading.className = 'empty-state';
+      loading.textContent = this.t('apps.loading');
+      this.elAppsRow.appendChild(loading);
+      return;
+    }
+
+    if (!hasApps) {
+      const empty = document.createElement('div');
+      empty.className = 'empty-state';
+      empty.textContent = this.t('apps.empty');
+      this.elAppsRow.appendChild(empty);
+      return;
+    }
+
+    for (const app of host.apps) {
+      const card = document.createElement('button');
+      card.className = 'host-card app-card focusable';
+      card.dataset.focusKey = `app:${host.id}:${app.id}`;
+
+      const h4 = document.createElement('h4');
+      h4.textContent = app.title;
+      card.appendChild(h4);
+
+      const tags = document.createElement('div');
+      tags.className = 'host-tags';
+      if (host.currentGame && app.id === host.currentGame) {
+        const runningTag = document.createElement('span');
+        runningTag.className = 'tag tag-fw';
+        runningTag.textContent = this.t('hosts.running');
+        tags.appendChild(runningTag);
+      }
+      if (app.hdr) {
+        const hdrTag = document.createElement('span');
+        hdrTag.className = 'tag';
+        hdrTag.textContent = 'HDR';
+        tags.appendChild(hdrTag);
+      }
+      card.appendChild(tags);
+      card.addEventListener('click', () => this.launchApp(host, app));
+      this.elAppsRow.appendChild(card);
+    }
+
+    if (host.currentGame) {
+      const quitBtn = document.createElement('button');
+      quitBtn.className = 'host-card quit-card focusable';
+      quitBtn.dataset.focusKey = 'quit-running';
+      quitBtn.textContent = this.t('apps.quitRunning');
+      quitBtn.addEventListener('click', () => this._quitRunningApp(host));
+      this.elAppsRow.appendChild(quitBtn);
     }
   }
 
@@ -433,12 +646,23 @@ class NightjarTizenApp {
     if (this.activeTab !== 'hosts' || !this.focusedEl || !this.focusedEl.dataset.hostId) return;
     const id = this.focusedEl.dataset.hostId;
     this.hosts = this.hosts.filter((h) => h.id !== id);
+    if (this.selectedHostId === id) {
+      this.selectedHostId = this.hosts[0]?.id || '';
+    }
+    if (this.homeState.lastPlayed && this.homeState.lastPlayed.hostId === id) {
+      this.homeState.lastPlayed = null;
+    }
+    if (this.homeState.lastHostId === id) {
+      this.homeState.lastHostId = this.selectedHostId;
+    }
     this._saveHosts();
-    this._renderHosts();
-    this._focusFirst();
+    this._saveHomeState();
+    this._renderHome();
+    this._focusInitial();
   }
 
   openAddHostModal() {
+    this._pushFocus();
     this.elAddModal.classList.remove('hidden');
     document.getElementById('input-host-name').value = '';
     document.getElementById('input-host-ip').value = '';
@@ -447,84 +671,34 @@ class NightjarTizenApp {
 
   closeAddHostModal() {
     this.elAddModal.classList.add('hidden');
-    this._focusFirst();
+    this._popFocus();
   }
 
-  saveNewHost() {
+  async saveNewHost() {
     const ip = document.getElementById('input-host-ip').value.trim();
     const name = document.getElementById('input-host-name').value.trim() || ip;
     if (!ip) return;
-    this.hosts.push({
+    const newHost = {
       id: `host-${Date.now()}`,
       name,
       address: ip,
       frameWarpVersion: 0,
       paired: false,
       serverCertPem: '',
-    });
+      currentGame: 0,
+      apps: [],
+    };
+    this.hosts.push(newHost);
+    this.selectedHostId = newHost.id;
     this._saveHosts();
-    this._renderHosts();
-    this.closeAddHostModal();
-  }
-
-  openAppsModal(host, apps, currentGame) {
-    this._selectedHostForApps = host;
-    this._runningAppId = currentGame || 0;
-    document.getElementById('apps-modal-title').textContent = this.t('modal.appsTitle', { host: host.name });
-    document.getElementById('btn-resume-running').classList.toggle('hidden', !this._runningAppId);
-    document.getElementById('btn-quit-running').classList.toggle('hidden', !this._runningAppId);
-
-    this.elAppsGrid.textContent = '';
-    if (!apps || apps.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty-state';
-      empty.textContent = this.t('modal.appsEmpty');
-      this.elAppsGrid.appendChild(empty);
-    } else {
-      for (const app of apps) {
-        const card = document.createElement('button');
-        card.className = 'host-card focusable';
-
-        const h4 = document.createElement('h4');
-        h4.textContent = app.title;
-        card.appendChild(h4);
-
-        const tags = document.createElement('div');
-        tags.className = 'host-tags';
-        if (app.id === this._runningAppId) {
-          const runningTag = document.createElement('span');
-          runningTag.className = 'tag tag-fw';
-          runningTag.textContent = 'Running';
-          tags.appendChild(runningTag);
-        }
-        if (app.hdr) {
-          const hdrTag = document.createElement('span');
-          hdrTag.className = 'tag';
-          hdrTag.textContent = 'HDR';
-          tags.appendChild(hdrTag);
-        }
-        card.appendChild(tags);
-
-        card.addEventListener('click', () => {
-          const resume = app.id === this._runningAppId;
-          this.closeAppsModal();
-          this._launchStream(host, app.id, resume);
-        });
-        this.elAppsGrid.appendChild(card);
-      }
-    }
-
-    this.elAppsModal.classList.remove('hidden');
-    this._focusFirst();
-  }
-
-  closeAppsModal() {
-    this.elAppsModal.classList.add('hidden');
-    this._focusFirst();
+    this.elAddModal.classList.add('hidden');
+    this._renderHome({ focusKey: `host:${newHost.id}` });
+    await this.selectHost(newHost);
   }
 
   showTvDialog(title, message, { confirm = false, okText = null, hideOk = false, onCancel = null } = {}) {
     return new Promise((resolve) => {
+      this._pushFocus();
       document.getElementById('tv-dialog-title').textContent = title;
       document.getElementById('tv-dialog-body').textContent = message;
       const okBtn = document.getElementById('btn-dialog-ok');
@@ -539,7 +713,7 @@ class NightjarTizenApp {
         cancelBtn.onclick = null;
         okBtn.classList.remove('hidden');
         this.elDialogModal.classList.add('hidden');
-        this._focusFirst();
+        this._popFocus();
         resolve(result);
       };
       okBtn.onclick = () => cleanup(true);
@@ -552,10 +726,10 @@ class NightjarTizenApp {
   }
 
   async _pairHostWithConcurrentModal(host) {
+    this._pushFocus();
     const pin = generatePairingPin();
     const ac = new AbortController();
 
-    // Start /pair immediately so the host displays the PIN prompt right away
     const pairPromise = pairHostAsync(this.wasm.runtime, host.address, pin, { signal: ac.signal });
 
     document.getElementById('tv-dialog-title').textContent = this.t('modal.pairTitle', { host: host.name });
@@ -583,29 +757,87 @@ class NightjarTizenApp {
       cancelBtn.onclick = null;
       okBtn.classList.remove('hidden');
       this.elDialogModal.classList.add('hidden');
-      this._focusFirst();
+      this._popFocus();
     }
   }
 
-  async connectHost(host) {
+  async _refreshHostsInBackground() {
+    if (!this.wasm.available || !this.wasm.runtime || this.hosts.length === 0) return;
+    const order = [...this.hosts].sort((a, b) => {
+      if (a.id === this.selectedHostId) return -1;
+      if (b.id === this.selectedHostId) return 1;
+      return 0;
+    });
+
+    for (const host of order) {
+      if (this.session || this._busy) break;
+      host.busy = true;
+      host.busyText = this.t('hosts.checking');
+      this._renderHome();
+      try {
+        const probe = await probeHostAsync(this.wasm.runtime, host.address);
+        host.busy = false;
+        if (!probe.error) {
+          host.online = true;
+          host.frameWarpVersion = probe.frameWarpVersion || 0;
+          host.currentGame = probe.currentGame || 0;
+          host.paired = Boolean(probe.paired) && Boolean(host.serverCertPem);
+          if (probe.hostname) host.name = probe.hostname;
+          if (host.id === this.selectedHostId && host.paired && !this.session && !this._busy) {
+            const appRes = await listAppsAsync(this.wasm.runtime, host.address);
+            if (!appRes.error && Array.isArray(appRes.apps)) {
+              host.apps = appRes.apps;
+            }
+          }
+        } else {
+          host.online = false;
+        }
+      } catch {
+        host.busy = false;
+        host.online = false;
+      }
+      this._saveHosts();
+      this._renderHome();
+    }
+
+    if (!this._userNavigated && this.activeTab === 'hosts' && !this.session && !this._hasOpenModal()) {
+      this._focusInitial();
+    }
+  }
+
+  async selectHost(host) {
+    if (this._busy) return;
     if (!this.wasm.available || !this.wasm.runtime || typeof this.wasm.runtime.startAsyncJob !== 'function') {
       await this.showTvDialog(this.t('dialog.engineMissingTitle'), this.t('dialog.engineMissingBody'));
       return;
     }
 
+    this._busy = true;
+    host.busy = true;
+    host.busyText = this.t('hosts.connecting');
+    this._renderHome();
+
     try {
       const probe = await probeHostAsync(this.wasm.runtime, host.address);
       if (probe.error) {
+        host.online = false;
+        host.busy = false;
+        this._saveHosts();
+        this._renderHome();
         await this.showTvDialog(this.t('dialog.connFailed'), `${host.address}: ${probe.error}`);
         return;
       }
+
+      host.online = true;
       host.frameWarpVersion = probe.frameWarpVersion || 0;
+      host.currentGame = probe.currentGame || 0;
       host.paired = Boolean(probe.paired) && Boolean(host.serverCertPem);
       if (probe.hostname) host.name = probe.hostname;
       this._saveHosts();
-      this._renderHosts();
 
       if (!host.paired) {
+        host.busy = false;
+        this._renderHome();
         const pairRes = await this._pairHostWithConcurrentModal(host);
         if (pairRes.cancelled) return;
         if (!pairRes.ok) {
@@ -615,17 +847,153 @@ class NightjarTizenApp {
         host.paired = true;
         if (pairRes.serverCertPem) host.serverCertPem = pairRes.serverCertPem;
         this._saveHosts();
-        this._renderHosts();
       }
 
+      this.selectedHostId = host.id;
+      this.homeState.lastHostId = host.id;
+      this._saveHomeState();
+      host.busy = true;
+      host.appsLoading = true;
+      this._renderHome();
+
       const appRes = await listAppsAsync(this.wasm.runtime, host.address);
+      host.appsLoading = false;
+      host.busy = false;
       if (appRes.error) {
+        this._saveHosts();
+        this._renderHome();
         await this.showTvDialog(this.t('dialog.connFailed'), appRes.error);
         return;
       }
-      this.openAppsModal(host, appRes.apps || [], probe.currentGame || 0);
+
+      host.apps = appRes.apps || [];
+      this._saveHosts();
+      let preferredFocus = `host:${host.id}`;
+      if (host.apps.length > 0) {
+        const running = host.currentGame && host.apps.find((a) => a.id === host.currentGame);
+        const targetApp = running || host.apps[0];
+        preferredFocus = `app:${host.id}:${targetApp.id}`;
+      }
+      this._renderHome({ focusKey: preferredFocus });
     } catch (err) {
+      host.online = false;
       await this.showTvDialog(this.t('dialog.streamError'), err.message || String(err));
+    } finally {
+      host.busy = false;
+      host.appsLoading = false;
+      this._busy = false;
+      this._renderHome();
+    }
+  }
+
+  async launchApp(host, app) {
+    if (this._busy) return;
+    if (!this.wasm.available || !this.wasm.runtime || typeof this.wasm.runtime.startAsyncJob !== 'function') {
+      await this.showTvDialog(this.t('dialog.engineMissingTitle'), this.t('dialog.engineMissingBody'));
+      return;
+    }
+
+    const decision = launchDecision(host, app.id);
+    if (decision === 'pair') {
+      return this.selectHost(host);
+    }
+
+    let resume = decision === 'resume';
+    if (decision === 'confirm-quit') {
+      const runningApp = (host.apps || []).find((a) => a.id === host.currentGame);
+      const runningTitle = runningApp ? runningApp.title : `#${host.currentGame}`;
+      const ok = await this.showTvDialog(
+        this.t('dialog.quitRunningTitle'),
+        this.t('dialog.quitRunningBody', { running: runningTitle, host: host.name, app: app.title }),
+        { confirm: true, okText: this.t('btn.quitAndStart') }
+      );
+      if (!ok) return;
+      this._busy = true;
+      try {
+        await cancelHostAppAsync(this.wasm.runtime, host.address);
+        host.currentGame = 0;
+      } finally {
+        this._busy = false;
+      }
+      resume = false;
+    }
+
+    this.selectedHostId = host.id;
+    this.homeState.lastHostId = host.id;
+    this.homeState.lastPlayed = {
+      hostId: host.id,
+      appId: app.id,
+      appTitle: app.title,
+    };
+    this._saveHomeState();
+    this._saveHosts();
+    await this._launchStream(host, app.id, resume);
+  }
+
+  async continueLastPlayed() {
+    if (this._busy) return;
+    const lp = this.homeState.lastPlayed;
+    if (!lp) return;
+    const host = this.hosts.find((h) => h.id === lp.hostId);
+    if (!host) return;
+    if (!this.wasm.available || !this.wasm.runtime || typeof this.wasm.runtime.startAsyncJob !== 'function') {
+      await this.showTvDialog(this.t('dialog.engineMissingTitle'), this.t('dialog.engineMissingBody'));
+      return;
+    }
+
+    this._busy = true;
+    host.busy = true;
+    host.busyText = this.t('hosts.connecting');
+    this._renderHome();
+
+    let probe;
+    try {
+      probe = await probeHostAsync(this.wasm.runtime, host.address);
+    } catch (err) {
+      host.busy = false;
+      host.online = false;
+      this._busy = false;
+      this._saveHosts();
+      this._renderHome();
+      await this.showTvDialog(this.t('dialog.connFailed'), err.message || String(err));
+      return;
+    } finally {
+      host.busy = false;
+      this._busy = false;
+    }
+
+    if (probe.error) {
+      host.online = false;
+      this._saveHosts();
+      this._renderHome();
+      await this.showTvDialog(this.t('dialog.connFailed'), `${host.address}: ${probe.error}`);
+      return;
+    }
+
+    host.online = true;
+    host.frameWarpVersion = probe.frameWarpVersion || 0;
+    host.currentGame = probe.currentGame || 0;
+    host.paired = Boolean(probe.paired) && Boolean(host.serverCertPem);
+    if (probe.hostname) host.name = probe.hostname;
+    this._saveHosts();
+    this._renderHome();
+
+    if (!host.paired) {
+      return this.selectHost(host);
+    }
+    await this.launchApp(host, { id: lp.appId, title: lp.appTitle });
+  }
+
+  async _quitRunningApp(host) {
+    if (this._busy || !this.wasm.available) return;
+    this._busy = true;
+    try {
+      await cancelHostAppAsync(this.wasm.runtime, host.address);
+      host.currentGame = 0;
+      this._saveHosts();
+      this._renderHome({ focusKey: `host:${host.id}` });
+    } finally {
+      this._busy = false;
     }
   }
 
@@ -687,7 +1055,8 @@ class NightjarTizenApp {
     this.input.setStreaming(false);
     this.elStream.classList.remove('active');
     this.elLauncher.classList.add('active');
-    this._focusFirst();
+    this._renderHome();
+    this._focusInitial();
   }
 
   toggleStreamMenu(open) {
@@ -698,8 +1067,11 @@ class NightjarTizenApp {
       if (document.pointerLockElement && document.exitPointerLock) {
         document.exitPointerLock();
       }
+      this._pushFocus();
       this._updateStreamMenuLabels();
-      this._focusFirst();
+      this._setFocus(document.getElementById('btn-sm-resume'));
+    } else if (this._focusStack.length > 0) {
+      this._focusStack.pop();
     }
   }
 
@@ -711,28 +1083,35 @@ class NightjarTizenApp {
   }
 
   _updateOverlay(s) {
-    document.getElementById('ov-session').textContent = s.session;
-    const fpsEl = document.getElementById('ov-fps');
-    if (fpsEl) {
-      fpsEl.textContent = `${s.rxFps ?? 0} / ${s.decodedFps ?? 0} / ${s.renderedFps ?? 0}${s.directScanout ? ' (Direct)' : ''}`;
+    if (!this.elOverlay || this.elOverlay.classList.contains('hidden') || !this.elOvRows) {
+      return;
     }
-    document.getElementById('ov-fw-state').textContent = s.directScanout
-      ? 'Direct Scanout'
-      : !s.enabled
-        ? 'Disabled'
-        : s.locked
-          ? 'LOCKED (Active)'
-          : 'Learning…';
-    document.getElementById('ov-fw-shift').textContent =
-      `${s.pixels[0].toFixed(1)}, ${s.pixels[1].toFixed(1)} px (peak ${s.peak.toFixed(1)})`;
-    const lensText = s.fov ? `FOV ${s.fov.toFixed(0)}°` : 'Flat';
-    document.getElementById('ov-fw-lens').textContent = `${lensText} · ${s.maskCells} mask cells`;
-    document.getElementById('ov-fw-frames').textContent =
-      `${s.warped} warped · ${s.extrapolated} extrap · ${s.untagged} untagged`;
-    const stageEl = document.getElementById('ov-stage');
-    if (stageEl) stageEl.textContent = s.stage || '—';
-    const diagEl = document.getElementById('ov-diag');
-    if (diagEl) diagEl.textContent = s.diag || '—';
+    const data = s.raw ? { ...s.raw, session: s.session, playbackQuality: s.playbackQuality } : s;
+    const rows = buildOverlayRows(data, (k, vars) => this.t(k, vars));
+
+    for (const row of rows) {
+      let entry = this._ovRowMap.get(row.key);
+      if (!entry) {
+        const div = document.createElement('div');
+        div.className = 'ov-row';
+        const labelEl = document.createElement('span');
+        labelEl.className = 'ov-label';
+        const valEl = document.createElement('span');
+        div.appendChild(labelEl);
+        div.appendChild(valEl);
+        this.elOvRows.appendChild(div);
+        entry = { labelEl, valEl, lastLabel: null, lastVal: null };
+        this._ovRowMap.set(row.key, entry);
+      }
+      if (entry.lastLabel !== row.label) {
+        entry.labelEl.textContent = row.label;
+        entry.lastLabel = row.label;
+      }
+      if (entry.lastVal !== row.value) {
+        entry.valEl.textContent = row.value;
+        entry.lastVal = row.value;
+      }
+    }
   }
 }
 

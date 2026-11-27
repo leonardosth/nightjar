@@ -215,6 +215,7 @@ export class WasmStreamSession {
       video.className = this.useVideoTexture ? 'video-sink-hidden' : 'video-sink-direct';
     }
 
+    let pollTick = 0;
     const pollOverlay = () => {
       if (this._stopped) return;
       if (typeof this.runtime.pollSessionEvents === 'function') {
@@ -236,9 +237,25 @@ export class WasmStreamSession {
         }
       }
 
-      if (!onStats || !this.runtime.getFrameWarpStatus) return;
+      const shouldPollStats = (pollTick % 5) === 0;
+      pollTick++;
+      if (!shouldPollStats || !onStats || !this.runtime.getFrameWarpStatus) return;
       try {
         const st = JSON.parse(this.runtime.getFrameWarpStatus());
+        let playbackQuality = null;
+        if (st.directScanout && video && typeof video.getVideoPlaybackQuality === 'function') {
+          try {
+            const q = video.getVideoPlaybackQuality();
+            if (q && typeof q.totalVideoFrames === 'number') {
+              playbackQuality = {
+                totalVideoFrames: q.totalVideoFrames,
+                droppedVideoFrames: q.droppedVideoFrames || 0,
+              };
+            }
+          } catch {
+            // ignore
+          }
+        }
         onStats({
           session: `${this.host.name} (${this.settings.resolution}@${this.settings.fps} ${this.settings.codec.toUpperCase()}${st.hdrActive ? ' HDR' : ''})`,
           rxFps: st.rxFps || 0,
@@ -256,6 +273,8 @@ export class WasmStreamSession {
           untagged: st.untagged || 0,
           stage: st.stage || '—',
           diag: st.diag || '—',
+          playbackQuality,
+          raw: st,
         });
       } catch {
         // ignore

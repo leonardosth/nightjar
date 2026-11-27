@@ -32,25 +32,28 @@
 
       <!-- Tab: Hosts -->
       <main id="tab-hosts" class="tab-panel active">
-        <section class="hero-card">
-          <div>
-            <h2 data-i18n="hero.title">Low-latency PC streaming for your TV</h2>
-            <p data-i18n="hero.body">
-              Hardware-decoded 4K video with optional Frame Warp camera prediction on supported hosts.
-            </p>
-          </div>
-          <div class="hero-actions">
-            <button id="btn-add-host" class="btn btn-primary focusable" data-i18n="btn.addPc" tabindex="0">+ Add PC</button>
-            <button id="btn-launch-demo" class="btn btn-secondary focusable" data-i18n="btn.openLab" tabindex="0">Open Frame Warp Lab</button>
-          </div>
+        <section id="continue-section" class="section-block hidden">
+          <button id="btn-continue" class="continue-card focusable" data-focus-key="continue" tabindex="0">
+            <span id="continue-kicker" class="continue-kicker">Quick Start</span>
+            <strong id="continue-title" class="continue-title">—</strong>
+            <span id="continue-sub" class="continue-sub">—</span>
+          </button>
         </section>
 
         <section class="section-block">
           <div class="section-header">
             <h3 data-i18n="hosts.heading">Saved PCs</h3>
-            <span class="hint" data-i18n="hosts.hint">Use TV Remote or Gamepad to select, Red key to remove</span>
+            <span id="home-status" class="hint" data-i18n="hosts.hint">Select a PC to show its apps · Red key removes a saved PC</span>
           </div>
-          <div id="hosts-grid" class="cards-grid"></div>
+          <div id="hosts-row" class="cards-row"></div>
+        </section>
+
+        <section id="apps-section" class="section-block hidden">
+          <div class="section-header">
+            <h3 id="apps-heading" data-i18n="apps.heading">Apps</h3>
+            <span id="apps-hint" class="hint" data-i18n="apps.hint">Select an app to stream right away</span>
+          </div>
+          <div id="apps-row" class="cards-row"></div>
         </section>
       </main>
 
@@ -186,21 +189,6 @@
       </div>
     </div>
 
-    <!-- App Library Modal -->
-    <div id="app-list-modal" class="modal hidden" role="dialog" aria-modal="true">
-      <div class="modal-card modal-wide">
-        <div class="modal-header-row">
-          <h3 id="apps-modal-title">Apps</h3>
-          <div class="modal-header-actions">
-            <button id="btn-resume-running" class="btn btn-primary focusable hidden" data-i18n="btn.resumeGame">Resume Running App</button>
-            <button id="btn-quit-running" class="btn btn-danger focusable hidden" data-i18n="btn.quitGame">Quit Running App</button>
-            <button id="btn-apps-close" class="btn btn-secondary focusable" data-i18n="btn.close">Close</button>
-          </div>
-        </div>
-        <div id="apps-grid" class="cards-grid apps-grid"></div>
-      </div>
-    </div>
-
     <!-- TV Notice / Pairing PIN Dialog Modal -->
     <div id="tv-dialog-modal" class="modal hidden" role="dialog" aria-modal="true">
       <div class="modal-card">
@@ -221,14 +209,7 @@
 
       <!-- Live Frame Warp & Performance Overlay -->
       <aside id="stream-overlay" class="stream-overlay hidden">
-        <div class="ov-row"><span class="ov-label">Session</span><span id="ov-session">Idle</span></div>
-        <div class="ov-row"><span class="ov-label">FPS (Rx/Dec/Ren)</span><span id="ov-fps">0 / 0 / 0</span></div>
-        <div class="ov-row"><span class="ov-label">Frame Warp</span><span id="ov-fw-state">Waiting…</span></div>
-        <div class="ov-row"><span class="ov-label">Shift</span><span id="ov-fw-shift">0.0, 0.0 px (peak 0.0)</span></div>
-        <div class="ov-row"><span class="ov-label">Lens / HUD</span><span id="ov-fw-lens">Flat · 0 cells</span></div>
-        <div class="ov-row"><span class="ov-label">Frames</span><span id="ov-fw-frames">0 warped · 0 extrap · 0 untagged</span></div>
-        <div class="ov-row"><span class="ov-label">Stage</span><span id="ov-stage">—</span></div>
-        <div class="ov-row"><span class="ov-label">EMSS</span><span id="ov-diag">—</span></div>
+        <div id="ov-rows"></div>
       </aside>
 
       <!-- Stream Menu Overlay -->

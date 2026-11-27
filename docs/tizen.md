@@ -13,12 +13,12 @@ Nightjar's Tizen TV port runs on **Samsung Smart TVs with Tizen OS 10** (Chromiu
    - All network, mTLS pairing (with X.509 certificate pinning), RTSP, ENet control, and RSA-2048 identity generation run on a single persistent `WorkerQueue` pthread — never blocking the browser main thread.
 2. **Dual hardware video pipeline (`TizenVideoDecoder` + `WarpGlRenderer`)**:
    - Uses `samsung::wasm::ElementaryMediaStreamSource` in `LatencyMode::kUltraLow`.
-   - **Frame Warp path (`RenderingMode::kVideoTexture`)**: decodes HEVC (up to Level 5.2 `hev1.1.6.L156.B0` for 4K120), AV1 (`av01.0.13M.08`), or H.264 directly into a **3-slot `GL_TEXTURE_EXTERNAL_OES` `TextureRing`** so the displayed frame stays valid across 120 Hz inter-frame redraws until replaced. Monotonic PTS values are matched back to exact RTP `frameNumber`s via `HTMLMediaElement::GetCurrentTime()` + `FrameRing::lookup_nearest`.
+   - **Frame Warp path (`RenderingMode::kVideoTexture`)**: decodes HEVC (up to Level 5.2 `hev1.1.6.L156.B0` for 4K120), AV1 (`av01.0.13M.08`), or H.264 directly into a **3-slot `GL_TEXTURE_EXTERNAL_OES` `TextureRing`** with chained `FillTextureWithNextFrame` calls so decoded frames never stall behind `requestAnimationFrame`. Frames are matched back to RTP `frameNumber`s via `HTMLMediaElement::GetCurrentTime()` + `FrameRing::lookup_nearest` with `PendingFrameQueue` FIFO fallback, keeping the displayed frame valid across 120 Hz inter-frame redraws until replaced.
    - **Direct scanout / HDR10 path (`RenderingMode::kMediaElement`)**: when Frame Warp is off, not offered by the host, or HDR10 (10-bit Main10) is enabled, frames go straight to the hardware `<video id="tizen-video-sink">` plane with zero shader pass and native HDR10 metadata passthrough.
 3. **Low-latency Opus audio (`TizenAudioDecoder`)**:
    - Decodes stereo or 5.1 multistream Opus via `libopus` into `SampleFormat::kS16` PCM packets fed into a second `ElementaryMediaTrack` on the same `ElementaryMediaStreamSource`.
 4. **10-foot TV UI (`tizen/app/`)**:
-   - Localized in English (`en`) and Brazilian Portuguese (`pt-BR`), 2D spatial D-pad/gamepad focus, W3C-to-Moonlight gamepad flag mapping with active controller bitmask and idle deduplication, app library picker (launch, resume, quit), concurrent PIN pairing with cancellation, and Tizen screensaver suppression (`webapis.appcommon.setScreenSaver`).
+   - Localized in English (`en`) and Brazilian Portuguese (`pt-BR`), 1-click **Quick Start / Resume** Continue card, inline horizontal PC & App rows, compacted W3C-to-Moonlight controller slots (`assignControllerSlots`) with edge-triggered A/B navigation (`NavRepeat`), concurrent PIN pairing with cancellation, and Tizen screensaver suppression (`webapis.appcommon.setScreenSaver`).
 
 ---
 
@@ -42,11 +42,16 @@ Enable Developer Mode on the TV (**Apps → `12345` → Developer Mode ON → en
 
 ---
 
-## 4K 60/120 fps Validation Checklist (S85F)
+## Performance Overlay & Frame Warp Diagnostics (S85F)
 
-1. Enable **Performance Overlay** in **Settings**.
-2. Start a 4K 60 fps @ 100 Mbps HEVC stream and verify `FPS (Rx/Dec/Ren)` shows `60 / 60 / 120` during camera motion with `Frame Warp: LOCKED (Active)` and `untagged` staying near `0`.
-3. Raise to 4K 120 fps @ 100–150 Mbps (HEVC and AV1) and confirm `Dec` keeps up with `Rx`. If `Dec` falls behind `Rx` in `kVideoTexture` mode at 4K120, test 4K60 + Frame Warp (120 Hz inter-frame redraws) vs 4K120 direct scanout (`Frame Warp: OFF`).
+1. Enable **Performance Overlay** in **Settings** (or via the in-stream menu).
+2. Read the live telemetry rows:
+   - **FPS**: `rx` (received from host) · `dec` (hardware decoded) · `screen` (new decoded frames shown) · `drawn` (WebGL draws including inter-frame Frame Warp redraws) · `Hz` (TV `requestAnimationFrame` refresh rate).
+   - **Totals**: `rx` · `screen` · `net lost` (RTP frame gaps) · `TV skipped` (unconsumed `Ready` frames overwritten) · `no id` (frames decoded without a pending queue entry).
+   - **Host encode / Network / TV decode / Queue → screen**: `min / avg / max ms` per 1 s rolling window, plus ENet RTT (`±var`) and bitrate (`Mbps`). In direct video mode, `TV decode` shows `getVideoPlaybackQuality()` totals/drops when available.
+   - **Frame Warp state**: `direct`, `off`, `connecting`, `host-no-fw`, `rtsp-no-fw` (host did not offer `0x5543` in RTSP), `request-failed`, `waiting-model`, `learning`, or `active` (`LOCKED`).
+   - **FW tags**: `tags/s`, `lead` (`last_tag_frame - last_shown_frame`), `model` generation + `M/S` lock flags, and host `lag ms`.
+3. For perceptible between-frame smoothness with Frame Warp, verify `Hz` is `120` (on a 60 Hz output, between-frame redraws have no intermediate refresh to fill; 120 fps stream + 120 Hz panel gives the lowest latency).
 
 ---
 

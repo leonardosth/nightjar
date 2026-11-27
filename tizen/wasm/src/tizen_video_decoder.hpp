@@ -1,6 +1,7 @@
 #pragma once
 
 #include "frame_warp_predictor.hpp"
+#include "stream_telemetry.hpp"
 
 #include <array>
 #include <atomic>
@@ -55,15 +56,20 @@ public:
         uint32_t frame_number,
         std::optional<GLuint>& out_superseded,
         std::optional<uint64_t> expected_gen = std::nullopt,
-        bool is_tagged = true);
+        bool is_tagged = true,
+        uint64_t filled_us = 0);
     void mark_filled(size_t slot, uint32_t frame_number) {
         std::optional<GLuint> ignored;
-        mark_filled(slot, frame_number, ignored, std::nullopt, true);
+        mark_filled(slot, frame_number, ignored, std::nullopt, true, 0);
     }
     void mark_fill_aborted(size_t slot, std::optional<uint64_t> expected_gen = std::nullopt);
 
     // Promotes Ready -> Displaying, returning the previous Displaying texture to RecycleTexture().
-    bool swap_to_display(uint32_t& out_frame, std::optional<GLuint>& out_recycle, bool* out_tagged = nullptr);
+    bool swap_to_display(
+        uint32_t& out_frame,
+        std::optional<GLuint>& out_recycle,
+        bool* out_tagged = nullptr,
+        uint64_t* out_filled_us = nullptr);
     GLuint current_display_texture() const;
 
 private:
@@ -72,6 +78,7 @@ private:
         SlotState state = SlotState::Free;
         uint32_t frame_number = 0;
         bool is_tagged = true;
+        uint64_t filled_us = 0;
     };
     mutable std::mutex mu_;
     std::array<Slot, 3> slots_{};
@@ -98,9 +105,16 @@ public:
     bool submit_access_unit(const uint8_t* data, size_t size, uint32_t frame_number, int64_t pts_us, bool keyframe);
 
     // Drives async FillTextureWithNextFrame into a Free slot and promotes Ready frames.
-    // Sets `out_tagged = false` when GetCurrentTime() could not match a FrameRing entry within tolerance.
-    bool poll_next_frame(GLuint& out_tex, uint32_t& out_frame, bool& out_tagged);
+    // Resolves frame identity via GetCurrentTime() + PendingFrameQueue FIFO fallback.
+    bool poll_next_frame(GLuint& out_tex, uint32_t& out_frame, bool& out_tagged, uint64_t* out_filled_us = nullptr);
     GLuint current_display_texture() const { return ring_.current_display_texture(); }
+
+    LatencySnapshot roll_decode_latency() { return decode_latency_.roll(); }
+    uint32_t decoded_total() const { return decoded_total_.load(std::memory_order_relaxed); }
+    uint32_t superseded_total() const { return superseded_total_.load(std::memory_order_relaxed); }
+    uint32_t unresolved_total() const { return unresolved_total_.load(std::memory_order_relaxed); }
+    uint32_t fill_errors() const { return fill_err_total_.load(std::memory_order_relaxed); }
+    uint32_t append_errors() const { return append_err_total_.load(std::memory_order_relaxed); }
 
     void* emss_source() const;
     bool is_direct_scanout() const { return !config_.use_video_texture; }
@@ -109,12 +123,21 @@ public:
     void shutdown();
 
 private:
+    void kick_fill();
+
     std::shared_ptr<frame_warp::FrameWarp> warp_;
     VideoConfig config_;
     bool initialized_ = false;
     uint64_t submitted_packets_ = 0;
     std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
     TextureRing ring_;
+    PendingFrameQueue pending_;
+    LatencyWindow decode_latency_;
+    std::atomic<uint32_t> decoded_total_{0};
+    std::atomic<uint32_t> superseded_total_{0};
+    std::atomic<uint32_t> unresolved_total_{0};
+    std::atomic<uint32_t> fill_err_total_{0};
+    std::atomic<uint32_t> append_err_total_{0};
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

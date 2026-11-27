@@ -20,7 +20,7 @@ namespace nightjar::tizen {
 void TextureRing::init(std::array<GLuint, 3> textures) {
     std::lock_guard<std::mutex> lk(mu_);
     for (size_t i = 0; i < 3; ++i) {
-        slots_[i] = Slot{textures[i], SlotState::Free, 0, true};
+        slots_[i] = Slot{textures[i], SlotState::Free, 0, true, 0};
     }
     displaying_.reset();
     ready_.reset();
@@ -34,6 +34,7 @@ void TextureRing::reset() {
         s.state = SlotState::Free;
         s.frame_number = 0;
         s.is_tagged = true;
+        s.filled_us = 0;
     }
     displaying_.reset();
     ready_.reset();
@@ -64,7 +65,8 @@ void TextureRing::mark_filled(
     uint32_t frame_number,
     std::optional<GLuint>& out_superseded,
     std::optional<uint64_t> expected_gen,
-    bool is_tagged) {
+    bool is_tagged,
+    uint64_t filled_us) {
     std::lock_guard<std::mutex> lk(mu_);
     out_superseded.reset();
     if (expected_gen.has_value() && *expected_gen != generation_) return;
@@ -76,6 +78,7 @@ void TextureRing::mark_filled(
     }
     slots_[slot].frame_number = frame_number;
     slots_[slot].is_tagged = is_tagged;
+    slots_[slot].filled_us = filled_us;
     slots_[slot].state = SlotState::Ready;
     ready_ = slot;
     filling_in_flight_ = false;
@@ -91,7 +94,11 @@ void TextureRing::mark_fill_aborted(size_t slot, std::optional<uint64_t> expecte
     filling_in_flight_ = false;
 }
 
-bool TextureRing::swap_to_display(uint32_t& out_frame, std::optional<GLuint>& out_recycle, bool* out_tagged) {
+bool TextureRing::swap_to_display(
+    uint32_t& out_frame,
+    std::optional<GLuint>& out_recycle,
+    bool* out_tagged,
+    uint64_t* out_filled_us) {
     std::lock_guard<std::mutex> lk(mu_);
     out_recycle.reset();
     if (!ready_.has_value()) return false;
@@ -108,6 +115,7 @@ bool TextureRing::swap_to_display(uint32_t& out_frame, std::optional<GLuint>& ou
     displaying_ = next_slot;
     out_frame = slots_[next_slot].frame_number;
     if (out_tagged) *out_tagged = slots_[next_slot].is_tagged;
+    if (out_filled_us) *out_filled_us = slots_[next_slot].filled_us;
     return true;
 }
 
@@ -136,6 +144,7 @@ struct TizenVideoDecoder::Impl
     std::function<void()> on_need_idr;
     std::function<void(void*)> on_source_ready_for_tracks;
     TextureRing* ring_ref = nullptr;
+    PendingFrameQueue* pending_ref = nullptr;
 
     // Live diagnostics surfaced in the TV overlay
     std::atomic<int> src_closed_count{0};
@@ -220,6 +229,7 @@ struct TizenVideoDecoder::Impl
     void OnTrackClosed(samsung::wasm::ElementaryMediaTrack::CloseReason) override {
         track_open.store(false, std::memory_order_release);
         if (ring_ref) ring_ref->reset();
+        if (pending_ref) pending_ref->clear();
     }
 
     void OnSessionIdChanged(samsung::wasm::SessionId new_id) override {
@@ -245,6 +255,13 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_e
     alive_ = std::make_shared<std::atomic<bool>>(true);
     config_ = config;
     submitted_packets_ = 0;
+    pending_.clear();
+    decode_latency_.roll();
+    decoded_total_.store(0, std::memory_order_relaxed);
+    superseded_total_.store(0, std::memory_order_relaxed);
+    unresolved_total_.store(0, std::memory_order_relaxed);
+    fill_err_total_.store(0, std::memory_order_relaxed);
+    append_err_total_.store(0, std::memory_order_relaxed);
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     using LatencyMode = samsung::wasm::ElementaryMediaStreamSource::LatencyMode;
     using RenderingMode = samsung::wasm::ElementaryMediaStreamSource::RenderingMode;
@@ -252,6 +269,7 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_e
     impl_->on_need_idr = config.on_need_idr;
     impl_->on_source_ready_for_tracks = config.on_source_ready_for_tracks;
     impl_->ring_ref = &ring_;
+    impl_->pending_ref = &pending_;
     impl_->use_video_texture = config.use_video_texture;
     impl_->codec = config.codec;
     impl_->width = config.width;
@@ -364,65 +382,93 @@ bool TizenVideoDecoder::submit_access_unit(
     impl_->last_append_op.store(static_cast<int>(ap_res.operation_result), std::memory_order_relaxed);
     if (ap_res) {
         impl_->append_ok.fetch_add(1u, std::memory_order_relaxed);
+        if (config_.use_video_texture) {
+            pending_.push(PendingFrameQueue::Entry{frame_number, effective_pts_us, steady_now_us()});
+        }
         return true;
     }
     impl_->append_err.fetch_add(1u, std::memory_order_relaxed);
+    append_err_total_.fetch_add(1u, std::memory_order_relaxed);
     return false;
 #else
     (void)keyframe;
+    if (config_.use_video_texture) {
+        pending_.push(PendingFrameQueue::Entry{frame_number, effective_pts_us, steady_now_us()});
+    }
     return true;
 #endif
 }
 
-bool TizenVideoDecoder::poll_next_frame(GLuint& out_tex, uint32_t& out_frame, bool& out_tagged) {
+void TizenVideoDecoder::kick_fill() {
+#if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
+    if (!initialized_ || !config_.use_video_texture) return;
+    if (!impl_->has_track || !impl_->track_open.load(std::memory_order_acquire)) return;
+    if (auto slot = ring_.acquire_for_fill()) {
+        GLuint fill_tex = ring_.texture_at(*slot);
+        size_t slot_idx = *slot;
+        uint64_t gen = ring_.generation();
+        auto alive = alive_;
+        impl_->video_track.FillTextureWithNextFrame(
+            fill_tex,
+            [this, alive, slot_idx, gen](samsung::wasm::OperationResult res) {
+                if (!alive->load(std::memory_order_acquire)) return;
+                impl_->last_fill_op.store(static_cast<int>(res), std::memory_order_relaxed);
+                if (res != samsung::wasm::OperationResult::kSuccess) {
+                    fill_err_total_.fetch_add(1u, std::memory_order_relaxed);
+                    ring_.mark_fill_aborted(slot_idx, gen);
+                    if (impl_->track_open.load(std::memory_order_acquire)) {
+                        kick_fill();
+                    }
+                    return;
+                }
+                const uint64_t now = steady_now_us();
+                const uint32_t fps = config_.fps ? config_.fps : 60u;
+                const int64_t half_frame_us = 500000LL / static_cast<int64_t>(fps);
+                std::optional<uint32_t> hint;
+                if (impl_->media_element && warp_) {
+                    auto t_res = impl_->media_element->GetCurrentTime();
+                    if (t_res) {
+                        int64_t cur_pts_us = static_cast<int64_t>(std::llround(t_res.value.count() * 1000000.0));
+                        hint = warp_->lookup_frame_pts_nearest(cur_pts_us, half_frame_us);
+                    }
+                }
+                uint32_t resolved_frame = 0;
+                bool is_tagged = false;
+                if (auto e = pending_.resolve(hint)) {
+                    resolved_frame = e->frame;
+                    is_tagged = true;
+                    if (now >= e->submit_us) {
+                        decode_latency_.add_us(now - e->submit_us);
+                    }
+                } else {
+                    unresolved_total_.fetch_add(1u, std::memory_order_relaxed);
+                }
+                decoded_total_.fetch_add(1u, std::memory_order_relaxed);
+
+                std::optional<GLuint> superseded;
+                ring_.mark_filled(slot_idx, resolved_frame, superseded, gen, is_tagged, now);
+                if (superseded.has_value() && impl_->has_track) {
+                    superseded_total_.fetch_add(1u, std::memory_order_relaxed);
+                    impl_->video_track.RecycleTexture(*superseded);
+                }
+                // Chain next fill immediately so hardware decoder never stalls behind rAF rate
+                kick_fill();
+            });
+    }
+#endif
+}
+
+bool TizenVideoDecoder::poll_next_frame(
+    GLuint& out_tex, uint32_t& out_frame, bool& out_tagged, uint64_t* out_filled_us) {
     if (!initialized_ || !config_.use_video_texture) return false;
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     if (!impl_->has_track || !impl_->track_open.load(std::memory_order_acquire)) return false;
-
-    auto kick_fill = [&]() {
-        if (auto slot = ring_.acquire_for_fill()) {
-            GLuint fill_tex = ring_.texture_at(*slot);
-            size_t slot_idx = *slot;
-            uint64_t gen = ring_.generation();
-            auto alive = alive_;
-            impl_->video_track.FillTextureWithNextFrame(
-                fill_tex,
-                [this, alive, slot_idx, gen](samsung::wasm::OperationResult res) {
-                    if (!alive->load(std::memory_order_acquire)) return;
-                    impl_->last_fill_op.store(static_cast<int>(res), std::memory_order_relaxed);
-                    if (res != samsung::wasm::OperationResult::kSuccess) {
-                        ring_.mark_fill_aborted(slot_idx, gen);
-                        return;
-                    }
-                    const uint32_t fps = config_.fps ? config_.fps : 60u;
-                    const int64_t half_frame_us = 500000LL / static_cast<int64_t>(fps);
-                    uint32_t resolved_frame = 0;
-                    bool is_tagged = false;
-
-                    if (impl_->media_element && warp_) {
-                        auto t_res = impl_->media_element->GetCurrentTime();
-                        if (t_res) {
-                            int64_t cur_pts_us = static_cast<int64_t>(std::llround(t_res.value.count() * 1000000.0));
-                            if (auto exact = warp_->lookup_frame_pts_nearest(cur_pts_us, half_frame_us)) {
-                                resolved_frame = *exact;
-                                is_tagged = true;
-                            }
-                        }
-                    }
-                    std::optional<GLuint> superseded;
-                    ring_.mark_filled(slot_idx, resolved_frame, superseded, gen, is_tagged);
-                    if (superseded.has_value() && impl_->has_track) {
-                        impl_->video_track.RecycleTexture(*superseded);
-                    }
-                });
-        }
-    };
 
     // Kick fill before swap so synchronous callbacks become available on this vsync
     kick_fill();
 
     std::optional<GLuint> to_recycle;
-    bool swapped = ring_.swap_to_display(out_frame, to_recycle, &out_tagged);
+    bool swapped = ring_.swap_to_display(out_frame, to_recycle, &out_tagged, out_filled_us);
     if (to_recycle.has_value()) {
         impl_->video_track.RecycleTexture(*to_recycle);
     }
@@ -435,6 +481,7 @@ bool TizenVideoDecoder::poll_next_frame(GLuint& out_tex, uint32_t& out_frame, bo
     (void)out_tex;
     (void)out_frame;
     out_tagged = false;
+    if (out_filled_us) *out_filled_us = 0;
     return false;
 #endif
 }
@@ -452,7 +499,8 @@ std::string TizenVideoDecoder::diagnostic_summary() const {
            " ap=" + std::to_string(impl_->append_ok.load(std::memory_order_relaxed)) +
            "/" + std::to_string(impl_->append_err.load(std::memory_order_relaxed)) +
            "(" + std::to_string(impl_->last_append_op.load(std::memory_order_relaxed)) + ")" +
-           " fl=" + std::to_string(impl_->last_fill_op.load(std::memory_order_relaxed));
+           " fl=" + std::to_string(impl_->last_fill_op.load(std::memory_order_relaxed)) +
+           " dq=" + std::to_string(pending_.size());
 #else
     return "native";
 #endif
@@ -464,6 +512,7 @@ void TizenVideoDecoder::shutdown() {
     }
     initialized_ = false;
     ring_.reset();
+    pending_.clear();
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     if (impl_) {
         if (impl_->has_track) {

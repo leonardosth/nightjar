@@ -1,6 +1,7 @@
 #include "nightjar_session.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -13,11 +14,6 @@
 namespace nightjar::tizen {
 
 namespace {
-
-uint64_t steady_now_us() {
-    using namespace std::chrono;
-    return static_cast<uint64_t>(duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count());
-}
 
 std::mutex g_active_mu;
 NightjarSession* g_active_session = nullptr;
@@ -75,6 +71,10 @@ int cb_video_setup(int /*video_format*/, int /*width*/, int /*height*/, int /*re
 int cb_submit_decode_unit(PDECODE_UNIT du) {
     auto* s = active_session();
     if (!s || !du) return DR_OK;
+    VideoUnitTiming timing;
+    timing.host_latency_tenth_ms = du->frameHostProcessingLatency;
+    timing.receive_us = du->receiveTimeUs;
+    timing.enqueue_us = du->enqueueTimeUs;
     // Fast single-buffer path when only one LENTRY exists
     if (du->bufferList && du->bufferList->next == nullptr && du->bufferList->data && du->bufferList->length > 0) {
         return s->on_video_decode_unit(
@@ -82,7 +82,8 @@ int cb_submit_decode_unit(PDECODE_UNIT du) {
             static_cast<size_t>(du->bufferList->length),
             static_cast<uint32_t>(du->frameNumber),
             static_cast<int64_t>(du->presentationTimeUs),
-            du->frameType == FRAME_TYPE_IDR);
+            du->frameType == FRAME_TYPE_IDR,
+            timing);
     }
     // Multi-LENTRY path reuses session's pre-allocated buffer via null-data sentinel
     static thread_local std::vector<uint8_t> scratch;
@@ -103,7 +104,8 @@ int cb_submit_decode_unit(PDECODE_UNIT du) {
         scratch.size(),
         static_cast<uint32_t>(du->frameNumber),
         static_cast<int64_t>(du->presentationTimeUs),
-        du->frameType == FRAME_TYPE_IDR);
+        du->frameType == FRAME_TYPE_IDR,
+        timing);
 }
 
 int cb_audio_init(int /*audio_cfg*/, const POPUS_MULTISTREAM_CONFIGURATION opus_cfg, void* /*ctx*/, int /*ar_flags*/) {
@@ -172,12 +174,41 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
     opts_ = opts;
     epoch_us_ = steady_now_us();
     last_fps_tick_us_ = 0;
+    prev_decoded_total_ = 0;
     rx_count_.store(0, std::memory_order_relaxed);
     dec_count_.store(0, std::memory_order_relaxed);
-    ren_count_.store(0, std::memory_order_relaxed);
+    shown_count_.store(0, std::memory_order_relaxed);
+    draw_count_.store(0, std::memory_order_relaxed);
+    refresh_count_.store(0, std::memory_order_relaxed);
+    tags_window_.store(0, std::memory_order_relaxed);
+    warp_redraw_count_.store(0, std::memory_order_relaxed);
+    bytes_window_.store(0, std::memory_order_relaxed);
     rx_fps_.store(0, std::memory_order_relaxed);
     dec_fps_.store(0, std::memory_order_relaxed);
     ren_fps_.store(0, std::memory_order_relaxed);
+    rx_total_.store(0, std::memory_order_relaxed);
+    shown_total_.store(0, std::memory_order_relaxed);
+    net_dropped_total_.store(0, std::memory_order_relaxed);
+    models_total_.store(0, std::memory_order_relaxed);
+    tags_total_.store(0, std::memory_order_relaxed);
+    masks_total_.store(0, std::memory_order_relaxed);
+    fw_bad_packets_.store(0, std::memory_order_relaxed);
+    has_last_tag_frame_.store(false, std::memory_order_relaxed);
+    last_tag_frame_.store(0, std::memory_order_relaxed);
+    has_last_shown_frame_.store(false, std::memory_order_relaxed);
+    last_shown_frame_.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(rx_frame_mu_);
+        have_last_frame_ = false;
+        last_rx_frame_ = 0;
+    }
+    host_latency_.roll();
+    net_latency_.roll();
+    present_latency_.roll();
+    {
+        std::lock_guard<std::mutex> lk(telemetry_mu_);
+        telemetry_ = TelemetrySnapshot{};
+    }
     frame_warp_negotiated_.store(false, std::memory_order_release);
     hdr_active_.store(opts.hdr, std::memory_order_release);
 
@@ -462,17 +493,31 @@ void NightjarSession::on_control_packet(uint16_t msg_type, const uint8_t* payloa
     switch (msg_type) {
         case frame_warp::kMsgModel:
             if (auto m = frame_warp::Model::decode(payload, len)) {
+                models_total_.fetch_add(1u, std::memory_order_relaxed);
                 warp_->on_model(*m);
+            } else {
+                fw_bad_packets_.fetch_add(1u, std::memory_order_relaxed);
             }
             break;
         case frame_warp::kMsgTags:
             if (auto t = frame_warp::Tags::decode(payload, len)) {
+                tags_total_.fetch_add(1u, std::memory_order_relaxed);
+                tags_window_.fetch_add(1u, std::memory_order_relaxed);
+                if (!t->tags.empty()) {
+                    last_tag_frame_.store(t->tags.back().frame, std::memory_order_relaxed);
+                    has_last_tag_frame_.store(true, std::memory_order_release);
+                }
                 warp_->on_tags(*t, now_us());
+            } else {
+                fw_bad_packets_.fetch_add(1u, std::memory_order_relaxed);
             }
             break;
         case frame_warp::kMsgMask:
             if (auto mask = frame_warp::Mask::decode(payload, len)) {
+                masks_total_.fetch_add(1u, std::memory_order_relaxed);
                 warp_->on_mask(std::move(*mask));
+            } else {
+                fw_bad_packets_.fetch_add(1u, std::memory_order_relaxed);
             }
             break;
         default:
@@ -481,9 +526,32 @@ void NightjarSession::on_control_packet(uint16_t msg_type, const uint8_t* payloa
 }
 
 int NightjarSession::on_video_decode_unit(
-    const uint8_t* data, size_t len, uint32_t frame_number, int64_t pts_us, bool keyframe) {
+    const uint8_t* data,
+    size_t len,
+    uint32_t frame_number,
+    int64_t pts_us,
+    bool keyframe,
+    const VideoUnitTiming& timing) {
     if (!decoder_) return 0;
     rx_count_.fetch_add(1u, std::memory_order_relaxed);
+    rx_total_.fetch_add(1u, std::memory_order_relaxed);
+    bytes_window_.fetch_add(static_cast<uint64_t>(len), std::memory_order_relaxed);
+
+    if (timing.host_latency_tenth_ms > 0) {
+        host_latency_.add_us(static_cast<uint64_t>(timing.host_latency_tenth_ms) * 100ull);
+    }
+    if (timing.enqueue_us >= timing.receive_us && timing.receive_us > 0) {
+        net_latency_.add_us(timing.enqueue_us - timing.receive_us);
+    }
+    {
+        std::lock_guard<std::mutex> lk(rx_frame_mu_);
+        if (have_last_frame_ && frame_number > last_rx_frame_ + 1u) {
+            net_dropped_total_.fetch_add(frame_number - last_rx_frame_ - 1u, std::memory_order_relaxed);
+        }
+        have_last_frame_ = true;
+        last_rx_frame_ = frame_number;
+    }
+
     bool ok = decoder_->submit_access_unit(data, len, frame_number, pts_us, keyframe);
     if (ok && decoder_->is_direct_scanout()) {
         dec_count_.fetch_add(1u, std::memory_order_relaxed);
@@ -591,16 +659,82 @@ void NightjarSession::tick_fps_window(uint64_t t_us) {
     }
     uint64_t dt = t_us - last_fps_tick_us_;
     if (dt >= 1000000ull) {
-        rx_fps_.store(rx_count_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
-        dec_fps_.store(dec_count_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
-        ren_fps_.store(ren_count_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+        const double sec = static_cast<double>(dt) / 1000000.0;
+        auto to_hz = [sec](uint32_t n) -> uint32_t {
+            return static_cast<uint32_t>(std::lround(static_cast<double>(n) / sec));
+        };
+
+        const uint32_t rx_n = rx_count_.exchange(0, std::memory_order_relaxed);
+        const uint32_t dec_direct_n = dec_count_.exchange(0, std::memory_order_relaxed);
+        const uint32_t shown_n = shown_count_.exchange(0, std::memory_order_relaxed);
+        const uint32_t draw_n = draw_count_.exchange(0, std::memory_order_relaxed);
+        const uint32_t refresh_n = refresh_count_.exchange(0, std::memory_order_relaxed);
+        const uint32_t tags_n = tags_window_.exchange(0, std::memory_order_relaxed);
+        const uint32_t warp_redraw_n = warp_redraw_count_.exchange(0, std::memory_order_relaxed);
+        const uint64_t bytes_n = bytes_window_.exchange(0, std::memory_order_relaxed);
+
+        const uint32_t cur_dec_total = decoder_ ? decoder_->decoded_total() : 0u;
+        const bool direct = decoder_ ? decoder_->is_direct_scanout() : !opts_.use_video_texture;
+        const uint32_t dec_n = direct
+            ? dec_direct_n
+            : (cur_dec_total >= prev_decoded_total_ ? (cur_dec_total - prev_decoded_total_) : cur_dec_total);
+        prev_decoded_total_ = cur_dec_total;
+
+        const uint32_t rx_rate = to_hz(rx_n);
+        const uint32_t dec_rate = to_hz(dec_n);
+        const uint32_t shown_rate = to_hz(shown_n);
+
+        rx_fps_.store(rx_rate, std::memory_order_relaxed);
+        dec_fps_.store(dec_rate, std::memory_order_relaxed);
+        ren_fps_.store(shown_rate, std::memory_order_relaxed);
         last_fps_tick_us_ = t_us;
+
+        TelemetrySnapshot snap;
+        snap.rx_fps = rx_rate;
+        snap.decoded_fps = dec_rate;
+        snap.shown_fps = shown_rate;
+        snap.draw_fps = to_hz(draw_n);
+        snap.display_hz = to_hz(refresh_n);
+        snap.tags_fps = to_hz(tags_n);
+        snap.warp_redraw_fps = to_hz(warp_redraw_n);
+
+        snap.rx_total = rx_total_.load(std::memory_order_relaxed);
+        snap.decoded_total = direct ? snap.rx_total : cur_dec_total;
+        snap.shown_total = shown_total_.load(std::memory_order_relaxed);
+        snap.net_dropped = net_dropped_total_.load(std::memory_order_relaxed);
+        if (decoder_) {
+            snap.skipped = decoder_->superseded_total();
+            snap.unresolved = decoder_->unresolved_total();
+            snap.append_err = decoder_->append_errors();
+            snap.fill_err = decoder_->fill_errors();
+            snap.dec_lat = decoder_->roll_decode_latency();
+        }
+        snap.host_lat = host_latency_.roll();
+        snap.net_lat = net_latency_.roll();
+        snap.present_lat = present_latency_.roll();
+        snap.mbps = (static_cast<double>(bytes_n) * 8.0) / (sec * 1000000.0);
+
+#ifdef NIGHTJAR_HAVE_MOONLIGHT
+        if (running_.load(std::memory_order_acquire)) {
+            uint32_t rtt = 0;
+            uint32_t rtt_var = 0;
+            if (LiGetEstimatedRttInfo(&rtt, &rtt_var)) {
+                snap.rtt_ms = rtt;
+                snap.rtt_var_ms = rtt_var;
+            }
+        }
+#endif
+        {
+            std::lock_guard<std::mutex> lk(telemetry_mu_);
+            telemetry_ = snap;
+        }
     }
 }
 
 void NightjarSession::on_display_refresh() {
     if (!running_.load(std::memory_order_acquire) || !warp_ || !decoder_) return;
     uint64_t t_us = now_us();
+    refresh_count_.fetch_add(1u, std::memory_order_relaxed);
     tick_fps_window(t_us);
 
     if (decoder_->is_direct_scanout()) {
@@ -610,16 +744,27 @@ void NightjarSession::on_display_refresh() {
     GLuint display_tex = 0;
     uint32_t frame_number = 0;
     bool is_tagged = false;
-    if (decoder_->poll_next_frame(display_tex, frame_number, is_tagged)) {
-        dec_count_.fetch_add(1u, std::memory_order_relaxed);
+    uint64_t filled_us = 0;
+    if (decoder_->poll_next_frame(display_tex, frame_number, is_tagged, &filled_us)) {
+        shown_total_.fetch_add(1u, std::memory_order_relaxed);
+        shown_count_.fetch_add(1u, std::memory_order_relaxed);
+        last_shown_frame_.store(frame_number, std::memory_order_relaxed);
+        has_last_shown_frame_.store(true, std::memory_order_relaxed);
+        if (filled_us > 0) {
+            const uint64_t abs_now = steady_now_us();
+            if (abs_now >= filled_us) {
+                present_latency_.add_us(abs_now - filled_us);
+            }
+        }
         auto w = (opts_.frame_warp_enabled && is_tagged) ? warp_->warp(frame_number, t_us) : frame_warp::Warp{};
         renderer_.sync_hud_mask(*warp_);
         renderer_.draw(display_tex, w, frame_number, warp_->input_seq());
-        ren_count_.fetch_add(1u, std::memory_order_relaxed);
+        draw_count_.fetch_add(1u, std::memory_order_relaxed);
     } else if (opts_.frame_warp_enabled) {
         GLuint held = decoder_->current_display_texture();
         if (renderer_.maybe_redraw_between_frames(held, *warp_, t_us)) {
-            ren_count_.fetch_add(1u, std::memory_order_relaxed);
+            draw_count_.fetch_add(1u, std::memory_order_relaxed);
+            warp_redraw_count_.fetch_add(1u, std::memory_order_relaxed);
         }
     }
 }
@@ -632,6 +777,43 @@ SessionStats NightjarSession::session_stats() const {
     s.hdr_active = hdr_active_.load(std::memory_order_relaxed);
     s.direct_scanout = decoder_ ? decoder_->is_direct_scanout() : !opts_.use_video_texture;
     return s;
+}
+
+TelemetrySnapshot NightjarSession::telemetry_snapshot() const {
+    std::lock_guard<std::mutex> lk(telemetry_mu_);
+    return telemetry_;
+}
+
+bool NightjarSession::rtsp_frame_warp_control() const {
+#ifdef NIGHTJAR_HAVE_MOONLIGHT
+    return LiHasFrameWarpControl();
+#else
+    return false;
+#endif
+}
+
+std::string NightjarSession::fw_state(const frame_warp::Status& st) const {
+    if (!opts_.use_video_texture) return "direct";
+    if (!opts_.frame_warp_enabled) return "off";
+    if (!running_.load(std::memory_order_acquire)) return "connecting";
+    if (host_frame_warp_version_ < 1) return "host-no-fw";
+#ifdef NIGHTJAR_HAVE_MOONLIGHT
+    if (!LiHasFrameWarpControl()) return "rtsp-no-fw";
+#endif
+    if (!frame_warp_negotiated_.load(std::memory_order_acquire)) return "request-failed";
+    if (!st.model.has_value()) return "waiting-model";
+    if (!st.model->locked()) return "learning";
+    return "active";
+}
+
+int32_t NightjarSession::tag_lead() const {
+    if (!has_last_tag_frame_.load(std::memory_order_relaxed) ||
+        !has_last_shown_frame_.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    return static_cast<int32_t>(
+        last_tag_frame_.load(std::memory_order_relaxed) -
+        last_shown_frame_.load(std::memory_order_relaxed));
 }
 
 std::string NightjarSession::stage_summary() const {

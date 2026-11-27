@@ -2,6 +2,7 @@
 #include "frame_warp_predictor.hpp"
 #include "frame_warp_protocol.hpp"
 #include "host_http_client.hpp"
+#include "stream_telemetry.hpp"
 #include "tizen_audio_decoder.hpp"
 #include "tizen_video_decoder.hpp"
 #include "worker_queue.hpp"
@@ -198,6 +199,54 @@ int main() {
         assert(s4.has_value());
         tr.mark_filled(*s4, 999u, superseded, stale_gen);
         assert(!tr.swap_to_display(f, recycle)); // stale callback ignored
+
+        // filled_us timestamp round-trips through mark_filled -> swap_to_display
+        auto s5 = tr.acquire_for_fill();
+        assert(s5.has_value());
+        std::optional<GLuint> sup5;
+        bool tagged5 = false;
+        uint64_t filled5 = 0;
+        tr.mark_filled(*s5, 777u, sup5, std::nullopt, true, 123456789ull);
+        assert(tr.swap_to_display(f, recycle, &tagged5, &filled5));
+        assert(f == 777u && tagged5 && filled5 == 123456789ull);
+    }
+
+    // 15. LatencyWindow and PendingFrameQueue telemetry primitives
+    {
+        LatencyWindow lw;
+        lw.add_us(1000);
+        lw.add_us(3000);
+        lw.add_us(2000);
+        auto snap1 = lw.roll();
+        assert(snap1.count == 3);
+        assert(std::fabs(snap1.min_ms - 1.0) < 1e-6);
+        assert(std::fabs(snap1.avg_ms - 2.0) < 1e-6);
+        assert(std::fabs(snap1.max_ms - 3.0) < 1e-6);
+        auto snap2 = lw.roll();
+        assert(snap2.count == 0);
+
+        PendingFrameQueue q;
+        q.push({10, 0, 100});
+        q.push({11, 8333, 200});
+        q.push({12, 16666, 300});
+        auto r1 = q.resolve(std::nullopt);
+        assert(r1.has_value() && r1->frame == 10);
+        auto r2 = q.resolve(12);
+        assert(r2.has_value() && r2->frame == 12);
+        assert(q.size() == 0);
+
+        for (uint32_t i = 0; i < 70; ++i) {
+            q.push({i, static_cast<int64_t>(i) * 1000, i});
+        }
+        assert(q.size() == PendingFrameQueue::kCapacity);
+        auto oldest = q.resolve(std::nullopt);
+        assert(oldest.has_value() && oldest->frame == 6); // 0..5 dropped
+
+        q.clear();
+        q.push({5, 0, 50});
+        auto fallback = q.resolve(999);
+        assert(fallback.has_value() && fallback->frame == 5);
+        assert(!q.resolve(std::nullopt).has_value());
     }
 
     // 14. TizenAudioDecoder::open_track_on_main_thread and reconfigure_opus are split cleanly

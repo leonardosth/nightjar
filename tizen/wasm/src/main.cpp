@@ -311,18 +311,33 @@ std::string get_frame_warp_status() {
     if (!s) return "{}";
     auto st = s->frame_warp_status();
     auto stats = s->session_stats();
+    auto tel = s->telemetry_snapshot();
+    auto finite_or_zero = [](double v) -> double {
+        return std::isfinite(v) ? v : 0.0;
+    };
+    auto write_lat = [&](std::ostringstream& os, const char* key, const nightjar::tizen::LatencySnapshot& lat) {
+        os << ",\"" << key << "\":{\"n\":" << lat.count
+           << ",\"min\":" << finite_or_zero(lat.min_ms)
+           << ",\"avg\":" << finite_or_zero(lat.avg_ms)
+           << ",\"max\":" << finite_or_zero(lat.max_ms) << "}";
+    };
     bool locked = st.model.has_value() && st.model->locked();
     float fov = 0.0f;
     if (st.model.has_value() && st.model->focal > 0.0f) {
         fov = 2.0f * std::atan((static_cast<float>(st.model->picture_width) * 0.5f) / st.model->focal) * 180.0f / 3.14159265f;
     }
+    const uint32_t model_gen = st.model.has_value() ? static_cast<uint32_t>(st.model->generation) : 0u;
+    const bool mouse_locked = st.model.has_value() && st.model->mouse_locked;
+    const bool stick_locked = st.model.has_value() && st.model->stick_locked;
+    const double lag_ms = st.model.has_value() ? (static_cast<double>(st.model->lag_us) / 1000.0) : 0.0;
+
     std::ostringstream os;
     os << "{\"negotiated\":" << (s->frame_warp_negotiated() ? "true" : "false")
        << ",\"locked\":" << (locked ? "true" : "false")
-       << ",\"pxX\":" << st.pixels[0]
-       << ",\"pxY\":" << st.pixels[1]
-       << ",\"peak\":" << st.peak
-       << ",\"fov\":" << fov
+       << ",\"pxX\":" << finite_or_zero(st.pixels[0])
+       << ",\"pxY\":" << finite_or_zero(st.pixels[1])
+       << ",\"peak\":" << finite_or_zero(st.peak)
+       << ",\"fov\":" << finite_or_zero(fov)
        << ",\"maskCells\":" << st.mask_cells
        << ",\"warped\":" << st.warped
        << ",\"extrapolated\":" << st.extrapolated
@@ -330,9 +345,39 @@ std::string get_frame_warp_status() {
        << ",\"rxFps\":" << stats.rx_fps
        << ",\"decodedFps\":" << stats.decoded_fps
        << ",\"renderedFps\":" << stats.rendered_fps
+       << ",\"drawFps\":" << tel.draw_fps
+       << ",\"displayHz\":" << tel.display_hz
+       << ",\"tagsFps\":" << tel.tags_fps
+       << ",\"warpRedrawFps\":" << tel.warp_redraw_fps
+       << ",\"rxTotal\":" << tel.rx_total
+       << ",\"decodedTotal\":" << tel.decoded_total
+       << ",\"shownTotal\":" << tel.shown_total
+       << ",\"netDropped\":" << tel.net_dropped
+       << ",\"skipped\":" << tel.skipped
+       << ",\"unresolved\":" << tel.unresolved
+       << ",\"appendErr\":" << tel.append_err
+       << ",\"fillErr\":" << tel.fill_err
+       << ",\"rttMs\":" << tel.rtt_ms
+       << ",\"rttVarMs\":" << tel.rtt_var_ms
+       << ",\"mbps\":" << finite_or_zero(tel.mbps)
+       << ",\"fwState\":\"" << json_escape(s->fw_state(st)) << "\""
+       << ",\"hostFw\":" << s->host_frame_warp_version()
+       << ",\"rtspFw\":" << (s->rtsp_frame_warp_control() ? "true" : "false")
+       << ",\"modelGen\":" << model_gen
+       << ",\"mouseLocked\":" << (mouse_locked ? "true" : "false")
+       << ",\"stickLocked\":" << (stick_locked ? "true" : "false")
+       << ",\"lagMs\":" << finite_or_zero(lag_ms)
+       << ",\"tagsTotal\":" << s->tags_total()
+       << ",\"modelsTotal\":" << s->models_total()
+       << ",\"masksTotal\":" << s->masks_total()
+       << ",\"tagLead\":" << s->tag_lead()
        << ",\"hdrActive\":" << (stats.hdr_active ? "true" : "false")
-       << ",\"directScanout\":" << (stats.direct_scanout ? "true" : "false")
-       << ",\"stage\":\"" << json_escape(s->stage_summary()) << "\""
+       << ",\"directScanout\":" << (stats.direct_scanout ? "true" : "false");
+    write_lat(os, "hostLat", tel.host_lat);
+    write_lat(os, "netLat", tel.net_lat);
+    write_lat(os, "decLat", tel.dec_lat);
+    write_lat(os, "presentLat", tel.present_lat);
+    os << ",\"stage\":\"" << json_escape(s->stage_summary()) << "\""
        << ",\"diag\":\"" << json_escape(s->decoder_summary()) << "\"}";
     return os.str();
 }

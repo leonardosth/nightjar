@@ -325,6 +325,10 @@ bool HostHttpClient::http_get(
         curl_easy_cleanup(curl);
         return false;
     }
+    // Pinning is enforced in memory via SSL_CTX_set_cert_verify_callback (verify_pinned_server_cert).
+    // Clear CAINFO/CAPATH so libcurl does not try to open a non-existent CA bundle in WASM's virtual FS.
+    curl_easy_setopt(curl, CURLOPT_CAINFO, nullptr);
+    curl_easy_setopt(curl, CURLOPT_CAPATH, nullptr);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, use_mtls ? 1L : 0L);
 
     SslMemIdentity mem_id{&identity_.cert_pem, &identity_.key_pem, &pinned};

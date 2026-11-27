@@ -27,6 +27,8 @@ struct VideoConfig {
     bool hdr10 = false;
     bool use_video_texture = true;
     std::function<void()> on_need_idr;
+    // Invoked on the main thread when EMSS transitions kDetached -> kClosed (safe to call AddTrack).
+    std::function<void(void* emss_source_ptr)> on_source_ready_for_tracks;
 };
 
 /**

@@ -167,6 +167,7 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
         }
     }
 
+    audio_decoder_ = std::make_unique<TizenAudioDecoder>();
     decoder_ = std::make_unique<TizenVideoDecoder>(warp_);
     VideoConfig vcfg;
     vcfg.codec = opts.codec;
@@ -180,6 +181,12 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
         LiRequestIdrFrame();
 #endif
     };
+    const bool surround51 = opts.surround51;
+    vcfg.on_source_ready_for_tracks = [this, surround51](void* emss_source_ptr) {
+        if (audio_decoder_) {
+            audio_decoder_->open_track_on_main_thread(48000, surround51, emss_source_ptr);
+        }
+    };
 
     std::string dec_err;
     if (!decoder_->initialize(vcfg, &dec_err)) {
@@ -187,14 +194,8 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
         return false;
     }
 
-    audio_decoder_ = std::make_unique<TizenAudioDecoder>();
-    // Add the audio track on the main thread BEFORE opening EMSS (AddTrack requires ReadyState::kClosed)
-    audio_decoder_->open_track_on_main_thread(48000, opts.surround51, decoder_->emss_source());
-    decoder_->open_source();
-
     if (opts.use_video_texture) {
         decoder_->attach_texture_ring(renderer_.video_textures());
-        decoder_->register_gl_context();
     }
 
     return true;

@@ -127,13 +127,63 @@ struct TizenVideoDecoder::Impl
     std::atomic<samsung::wasm::SessionId> session_id{0};
     std::atomic<bool> track_open{false};
     bool has_track = false;
+    bool use_video_texture = true;
+    std::string codec = "hevc";
+    uint32_t width = 3840;
+    uint32_t height = 2160;
+    uint32_t fps = 60;
+    bool hdr10 = false;
     std::function<void()> on_need_idr;
+    std::function<void(void*)> on_source_ready_for_tracks;
     TextureRing* ring_ref = nullptr;
 
-    void OnSourceClosed() override {
-        if (source) {
-            source->Open([](samsung::wasm::OperationResult) {});
+    void attach_tracks_and_open() {
+        if (!source) return;
+        if (!has_track) {
+            const uint32_t eff_fps = fps ? fps : 60u;
+            const std::string primary_mime = build_video_mime(codec, width, height, eff_fps, hdr10);
+            auto try_add = [&](const std::string& mime) {
+                return source->AddTrack(samsung::wasm::ElementaryVideoTrackConfig{
+                    mime,
+                    {},
+                    width,
+                    height,
+                    eff_fps,
+                    1u,
+                });
+            };
+            auto add_res = try_add(primary_mime);
+            if (!add_res) {
+                std::string fallback_mime = (codec == "av1")
+                    ? "video/mp4; codecs=\"av01.0.08M.08\""
+                    : (codec == "h264")
+                        ? "video/mp4; codecs=\"avc1.4d401f\""
+                        : "video/mp4; codecs=\"hev1.1.6.L93.B0\"";
+                if (fallback_mime != primary_mime) {
+                    add_res = try_add(fallback_mime);
+                }
+            }
+            if (!add_res) {
+                return;
+            }
+            video_track = std::move(add_res.value);
+            video_track.SetListener(this);
+            has_track = true;
+
+            if (on_source_ready_for_tracks) {
+                on_source_ready_for_tracks(static_cast<void*>(source.get()));
+            }
+            if (use_video_texture) {
+                (void)video_track.RegisterCurrentGraphicsContext();
+            }
         }
+        source->Open([](samsung::wasm::OperationResult) {});
+    }
+
+    void OnSourceClosed() override {
+        // Fired when HTMLMediaElement::SetSrc() finishes transitioning kDetached -> kClosed,
+        // and whenever the source later closes. Safe point to AddTrack() and Open().
+        attach_tracks_and_open();
     }
 
     void OnSourceOpenPending() override {
@@ -180,20 +230,24 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_e
     using RenderingMode = samsung::wasm::ElementaryMediaStreamSource::RenderingMode;
 
     impl_->on_need_idr = config.on_need_idr;
+    impl_->on_source_ready_for_tracks = config.on_source_ready_for_tracks;
     impl_->ring_ref = &ring_;
+    impl_->use_video_texture = config.use_video_texture;
+    impl_->codec = config.codec;
+    impl_->width = config.width;
+    impl_->height = config.height;
+    impl_->fps = config.fps ? config.fps : 60u;
+    impl_->hdr10 = config.hdr10;
     impl_->media_element = std::make_unique<samsung::html::HTMLMediaElement>("tizen-video-sink");
     const RenderingMode rmode = config.use_video_texture
         ? RenderingMode::kVideoTexture
         : RenderingMode::kMediaElement;
 
-    const char* chosen_latency = "kUltraLow";
     impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kUltraLow, rmode);
     if (!impl_->source->IsValid()) {
-        chosen_latency = "kLow";
         impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kLow, rmode);
     }
     if (!impl_->source->IsValid()) {
-        chosen_latency = "kNormal";
         impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kNormal, rmode);
     }
 
@@ -209,57 +263,14 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_e
     }
 
     impl_->source->SetListener(impl_.get());
-    impl_->media_element->SetSrc(impl_->source.get());
-
-    const uint32_t fps = config.fps ? config.fps : 60u;
-    const std::string primary_mime = build_video_mime(
-        config.codec,
-        config.width,
-        config.height,
-        fps,
-        config.hdr10);
-
-    auto try_add = [&](const std::string& mime) {
-        return impl_->source->AddTrack(samsung::wasm::ElementaryVideoTrackConfig{
-            mime,
-            {},
-            config.width,
-            config.height,
-            fps,
-            1u,
-        });
-    };
-
-    auto add_res = try_add(primary_mime);
-    int op1 = static_cast<int>(add_res.operation_result);
-    std::string fallback_mime;
-    if (!add_res) {
-        if (config.codec == "av1") {
-            fallback_mime = "video/mp4; codecs=\"av01.0.08M.08\"";
-        } else if (config.codec == "h264") {
-            fallback_mime = "video/mp4; codecs=\"avc1.4d401f\"";
-        } else {
-            fallback_mime = "video/mp4; codecs=\"hev1.1.6.L93.B0\"";
-        }
-        if (fallback_mime != primary_mime) {
-            add_res = try_add(fallback_mime);
-        }
-    }
-    if (!add_res) {
+    auto set_src_res = impl_->media_element->SetSrc(impl_->source.get());
+    if (!set_src_res) {
         if (out_error) {
-            *out_error = "AddTrack failed: op1=" + std::to_string(op1) +
-                         " (" + primary_mime + ")" +
-                         " op2=" + std::to_string(static_cast<int>(add_res.operation_result)) +
-                         " (" + fallback_mime + ")" +
-                         " lat=" + chosen_latency +
-                         " rmode=" + (config.use_video_texture ? "vtex" : "media") +
-                         " " + std::to_string(config.width) + "x" + std::to_string(config.height) + "@" + std::to_string(fps);
+            *out_error = "SetSrc failed: op=" + std::to_string(static_cast<int>(set_src_res.operation_result));
         }
         return false;
     }
-    impl_->video_track = std::move(add_res.value);
-    impl_->video_track.SetListener(impl_.get());
-    impl_->has_track = true;
+    // Tracks are added in OnSourceClosed() once SetSrc() completes kDetached -> kClosed.
 #else
     (void)out_error;
 #endif
@@ -268,11 +279,7 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_e
 }
 
 void TizenVideoDecoder::open_source() {
-#if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
-    if (initialized_ && impl_ && impl_->source) {
-        impl_->source->Open([](samsung::wasm::OperationResult) {});
-    }
-#endif
+    // Opening is triggered automatically in OnSourceClosed() right after AddTrack() succeeds.
 }
 
 void* TizenVideoDecoder::emss_source() const {

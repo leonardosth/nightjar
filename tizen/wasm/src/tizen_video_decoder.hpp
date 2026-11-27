@@ -88,7 +88,7 @@ public:
     ~TizenVideoDecoder();
 
     // Creates EMSS and adds the video track (does NOT call source->Open() yet so caller can add audio track first).
-    bool initialize(const VideoConfig& config);
+    bool initialize(const VideoConfig& config, std::string* out_error = nullptr);
     // Opens the EMSS after all tracks (video + audio) have been added on the main thread.
     void open_source();
     bool register_gl_context();

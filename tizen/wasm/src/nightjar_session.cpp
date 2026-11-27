@@ -181,8 +181,9 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
 #endif
     };
 
-    if (!decoder_->initialize(vcfg)) {
-        out_error = "TizenVideoDecoder initialization failed";
+    std::string dec_err;
+    if (!decoder_->initialize(vcfg, &dec_err)) {
+        out_error = dec_err.empty() ? "TizenVideoDecoder initialization failed" : ("TizenVideoDecoder: " + dec_err);
         return false;
     }
 

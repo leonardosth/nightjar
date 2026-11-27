@@ -170,7 +170,7 @@ TizenVideoDecoder::~TizenVideoDecoder() {
     shutdown();
 }
 
-bool TizenVideoDecoder::initialize(const VideoConfig& config) {
+bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_error) {
     shutdown();
     alive_ = std::make_shared<std::atomic<bool>>(true);
     config_ = config;
@@ -182,34 +182,86 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config) {
     impl_->on_need_idr = config.on_need_idr;
     impl_->ring_ref = &ring_;
     impl_->media_element = std::make_unique<samsung::html::HTMLMediaElement>("tizen-video-sink");
-    impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(
-        LatencyMode::kUltraLow,
-        config.use_video_texture ? RenderingMode::kVideoTexture : RenderingMode::kMediaElement
-    );
+    const RenderingMode rmode = config.use_video_texture
+        ? RenderingMode::kVideoTexture
+        : RenderingMode::kMediaElement;
+
+    const char* chosen_latency = "kUltraLow";
+    impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kUltraLow, rmode);
+    if (!impl_->source->IsValid()) {
+        chosen_latency = "kLow";
+        impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kLow, rmode);
+    }
+    if (!impl_->source->IsValid()) {
+        chosen_latency = "kNormal";
+        impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kNormal, rmode);
+    }
+
+    const bool src_valid = impl_->source->IsValid();
+    const bool el_valid = impl_->media_element->IsValid();
+    if (!src_valid || !el_valid) {
+        if (out_error) {
+            *out_error = std::string("EMSS invalid: srcValid=") + (src_valid ? "1" : "0") +
+                         " elValid=" + (el_valid ? "1" : "0") +
+                         " rmode=" + (config.use_video_texture ? "kVideoTexture" : "kMediaElement");
+        }
+        return false;
+    }
+
     impl_->source->SetListener(impl_.get());
     impl_->media_element->SetSrc(impl_->source.get());
 
-    const std::string mime = build_video_mime(
+    const uint32_t fps = config.fps ? config.fps : 60u;
+    const std::string primary_mime = build_video_mime(
         config.codec,
         config.width,
         config.height,
-        config.fps ? config.fps : 60u,
+        fps,
         config.hdr10);
 
-    auto add_res = impl_->source->AddTrack(samsung::wasm::ElementaryVideoTrackConfig{
-        mime,
-        {},
-        config.width,
-        config.height,
-        config.fps ? config.fps : 60u,
-        1u,
-    });
+    auto try_add = [&](const std::string& mime) {
+        return impl_->source->AddTrack(samsung::wasm::ElementaryVideoTrackConfig{
+            mime,
+            {},
+            config.width,
+            config.height,
+            fps,
+            1u,
+        });
+    };
+
+    auto add_res = try_add(primary_mime);
+    int op1 = static_cast<int>(add_res.operation_result);
+    std::string fallback_mime;
     if (!add_res) {
+        if (config.codec == "av1") {
+            fallback_mime = "video/mp4; codecs=\"av01.0.08M.08\"";
+        } else if (config.codec == "h264") {
+            fallback_mime = "video/mp4; codecs=\"avc1.4d401f\"";
+        } else {
+            fallback_mime = "video/mp4; codecs=\"hev1.1.6.L93.B0\"";
+        }
+        if (fallback_mime != primary_mime) {
+            add_res = try_add(fallback_mime);
+        }
+    }
+    if (!add_res) {
+        if (out_error) {
+            *out_error = "AddTrack failed: op1=" + std::to_string(op1) +
+                         " (" + primary_mime + ")" +
+                         " op2=" + std::to_string(static_cast<int>(add_res.operation_result)) +
+                         " (" + fallback_mime + ")" +
+                         " lat=" + chosen_latency +
+                         " rmode=" + (config.use_video_texture ? "vtex" : "media") +
+                         " " + std::to_string(config.width) + "x" + std::to_string(config.height) + "@" + std::to_string(fps);
+        }
         return false;
     }
     impl_->video_track = std::move(add_res.value);
     impl_->video_track.SetListener(impl_.get());
     impl_->has_track = true;
+#else
+    (void)out_error;
 #endif
     initialized_ = true;
     return true;

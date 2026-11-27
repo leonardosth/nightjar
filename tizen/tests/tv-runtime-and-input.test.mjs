@@ -495,4 +495,125 @@ test('InputManager routes D-Pad and Enter to navigation when stream menu is open
   }
 });
 
+test('patch_moonlight_frame_warp.py applies Frame Warp v1 and Samsung Tizen Sockets Extension patches idempotently', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'nj-ml-patch-'));
+  try {
+    await fs.mkdir(path.join(tmp, 'src'), { recursive: true });
+    await fs.mkdir(path.join(tmp, 'enet'), { recursive: true });
+
+    await fs.writeFile(
+      path.join(tmp, 'src', 'Limelight.h'),
+      '#ifdef __cplusplus\nextern "C" {\n#endif\nint LiStartConnection(void);\n#ifdef __cplusplus\n}\n#endif\n'
+    );
+    await fs.writeFile(
+      path.join(tmp, 'src', 'RtspConnection.c'),
+      '#include "Limelight-internal.h"\n' +
+      'static bool transactRtspMessageTcp(void) {\n' +
+      '    int err = 0; int* error = &err;\n' +
+      '    if (*error == ECONNREFUSED) {\n' +
+      '        return false;\n' +
+      '    }\n' +
+      '    return true;\n' +
+      '}\n' +
+      'int performRtspHandshake(PSERVER_INFORMATION serverInfo) {\n' +
+      '    ReferenceFrameInvalidationSupported = strstr(response.payload, "x-nv-video[0].refPicInvalidation") != NULL;\n' +
+      '    return 0;\n' +
+      '}\n'
+    );
+    await fs.writeFile(
+      path.join(tmp, 'src', 'ControlStream.c'),
+      '#include "Limelight-internal.h"\n' +
+      'void handle(void) {\n' +
+      '    if (0) {}\n' +
+      '    else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {\n' +
+      '    }\n' +
+      '}\n'
+    );
+    await fs.writeFile(
+      path.join(tmp, 'src', 'PlatformSockets.c'),
+      '#include "Limelight-internal.h"\n' +
+      'int recvUdpSocket(void) {\n' +
+      '    int err = -1;\n' +
+      '    do {\n' +
+      '        if (err < 0 && (LastSocketError() == EWOULDBLOCK || LastSocketError() == ETIMEDOUT)) {\n' +
+      '            return 0;\n' +
+      '        }\n' +
+      '    } while (err < 0 && LastSocketError() == ECONNREFUSED);\n' +
+      '    return err;\n' +
+      '}\n' +
+      'int setSocketNonBlocking(SOCKET s, bool enabled) {\n' +
+      '#if defined(__vita__) || defined(__HAIKU__)\n' +
+      '    return 0;\n' +
+      '#endif\n' +
+      '}\n' +
+      'int connectTcpSocket(void) {\n' +
+      '    int err = 0;\n' +
+      '    if (err != EWOULDBLOCK && err != EAGAIN && err != EINPROGRESS) {\n' +
+      '        return -1;\n' +
+      '    }\n' +
+      '    return 0;\n' +
+      '}\n'
+    );
+    await fs.writeFile(
+      path.join(tmp, 'enet', 'unix.c'),
+      'ENetSocket\nenet_socket_create (int af, ENetSocketType type)\n{\n' +
+      '    ENetSocket sock = socket (af, type == ENET_SOCKET_TYPE_DATAGRAM ? SOCK_DGRAM : SOCK_STREAM, 0);\n' +
+      '    return sock;\n' +
+      '}\n' +
+      'int enet_socket_set_option(void) {\n' +
+      '    switch (0) {\n' +
+      '        case ENET_SOCKOPT_NONBLOCK:\n' +
+      '#ifdef HAS_FCNTL\n' +
+      '            result = fcntl (socket, F_SETFL, (value ? O_NONBLOCK : 0) | (fcntl (socket, F_GETFL, 0) & ~O_NONBLOCK));\n' +
+      '#endif\n' +
+      '            break;\n' +
+      '    }\n' +
+      '}\n' +
+      'int enet_socket_connect(void) {\n' +
+      '    if (result == -1 && errno == EINPROGRESS)\n' +
+      '      return 0;\n' +
+      '}\n' +
+      'int enet_socket_send(void) {\n' +
+      '        switch (errno)\n        {\n        case EWOULDBLOCK:\n            return 0;\n        }\n' +
+      '}\n' +
+      'int enet_socket_receive(void) {\n' +
+      '    if (recvLength == -1)\n    {\n       if (errno == EWOULDBLOCK)\n         return 0;\n    }\n' +
+      '    if (recvLength == -1)\n    {\n       if (errno == EWOULDBLOCK)\n         return 0;\n    }\n' +
+      '}\n'
+    );
+
+    const scriptPath = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '..',
+      'wasm',
+      'scripts',
+      'patch_moonlight_frame_warp.py'
+    );
+
+    execFileSync('python', [scriptPath, tmp], { stdio: 'pipe' });
+    // Second invocation must be a clean idempotent no-op
+    execFileSync('python', [scriptPath, tmp], { stdio: 'pipe' });
+
+    const psPatched = await fs.readFile(path.join(tmp, 'src', 'PlatformSockets.c'), 'utf8');
+    const enetPatched = await fs.readFile(path.join(tmp, 'enet', 'unix.c'), 'utf8');
+    const rtspPatched = await fs.readFile(path.join(tmp, 'src', 'RtspConnection.c'), 'utf8');
+
+    assert.match(psPatched, /#if defined\(__EMSCRIPTEN__\)[\s\S]*return SOCKET_ERROR;/);
+    assert.match(psPatched, /__WASI_ERRNO_AGAIN/);
+    assert.match(enetPatched, /sock_flags = SOCK_NONBLOCK;/);
+    assert.match(enetPatched, /__WASI_ERRNO_INPROGRESS/);
+    assert.match(rtspPatched, /__WASI_ERRNO_CONNREFUSED/);
+    assert.match(rtspPatched, /rlHasFrameWarpControl/);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+
 

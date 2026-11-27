@@ -1,6 +1,7 @@
 #include "nightjar_session.hpp"
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -37,6 +38,18 @@ void cb_stage_complete(int stage) {
 
 void cb_stage_failed(int stage, int error_code) {
     if (auto* s = active_session()) s->on_stage_failed(LiGetStageName(stage), error_code);
+}
+
+void cb_log_message(const char* format, ...) {
+    if (!format) return;
+    auto* s = active_session();
+    if (!s) return;
+    char buf[512];
+    va_list va;
+    va_start(va, format);
+    std::vsnprintf(buf, sizeof(buf), format, va);
+    va_end(va);
+    s->on_log_message(buf);
 }
 
 void cb_connection_started() {
@@ -303,6 +316,7 @@ bool NightjarSession::connect_on_worker_thread(std::string& out_error) {
     cl.stageStarting = cb_stage_starting;
     cl.stageComplete = cb_stage_complete;
     cl.stageFailed = cb_stage_failed;
+    cl.logMessage = cb_log_message;
     cl.connectionStarted = cb_connection_started;
     cl.connectionTerminated = cb_connection_terminated;
     cl.connectionStatusUpdate = cb_connection_status_update;
@@ -328,7 +342,8 @@ bool NightjarSession::connect_on_worker_thread(std::string& out_error) {
             std::lock_guard<std::mutex> lk(g_active_mu);
             if (g_active_session == this) g_active_session = nullptr;
         }
-        out_error = "LiStartConnection failed with code " + std::to_string(rc);
+        std::string detail = stage_summary();
+        out_error = "LiStartConnection failed (" + std::to_string(rc) + "): " + detail;
         return false;
     }
 #endif
@@ -398,6 +413,18 @@ void NightjarSession::on_stage_failed(const char* name, int error_code) {
     stage_text_ = std::string("FAILED ") + (name ? name : "?") + " (" + std::to_string(error_code) + ")";
 }
 
+void NightjarSession::on_log_message(const char* msg) {
+    if (!msg) return;
+    std::string trimmed(msg);
+    while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r' || trimmed.back() == ' ')) {
+        trimmed.pop_back();
+    }
+    if (trimmed.empty()) return;
+    if (trimmed.size() > 120) trimmed.resize(120);
+    std::lock_guard<std::mutex> lk(events_mu_);
+    last_log_ = std::move(trimmed);
+}
+
 void NightjarSession::on_connection_started() {
     {
         std::lock_guard<std::mutex> lk(events_mu_);
@@ -458,6 +485,9 @@ int NightjarSession::on_video_decode_unit(
     if (!decoder_) return 0;
     rx_count_.fetch_add(1u, std::memory_order_relaxed);
     bool ok = decoder_->submit_access_unit(data, len, frame_number, pts_us, keyframe);
+    if (ok && decoder_->is_direct_scanout()) {
+        dec_count_.fetch_add(1u, std::memory_order_relaxed);
+    }
 #ifdef NIGHTJAR_HAVE_MOONLIGHT
     return ok ? DR_OK : DR_NEED_IDR;
 #else
@@ -606,7 +636,8 @@ SessionStats NightjarSession::session_stats() const {
 
 std::string NightjarSession::stage_summary() const {
     std::lock_guard<std::mutex> lk(events_mu_);
-    return stage_text_;
+    if (last_log_.empty()) return stage_text_;
+    return stage_text_ + " · " + last_log_;
 }
 
 std::string NightjarSession::decoder_summary() const {

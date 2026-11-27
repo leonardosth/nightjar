@@ -18,7 +18,7 @@ if(EMSCRIPTEN)
     set(MOONLIGHT_COMMON_C_DIR "/opt/moonlight-common-c" CACHE PATH "Path to patched moonlight-common-c")
     set(OPUS_PREFIX "/opt/opus" CACHE PATH "Path to pre-built static libopus")
 
-    add_compile_options(-s WASM=1 -O3 -DSAMSUNG_WRT -DOS_WASM -DNDEBUG)
+    add_compile_options(-s WASM=1 -pthread -O3 -DSAMSUNG_WRT -DOS_WASM -DNDEBUG)
 
     set(NIGHTJAR_WASM_LIBS nightjar_frame_warp)
     set(NIGHTJAR_WASM_DEFS NIGHTJAR_HAVE_CURL_OPENSSL=1)

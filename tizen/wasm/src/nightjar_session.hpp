@@ -61,6 +61,7 @@ public:
     void on_stage_starting(const char* name);
     void on_stage_complete(const char* name);
     void on_stage_failed(const char* name, int error_code);
+    void on_log_message(const char* msg);
     void on_connection_started();
     void on_connection_terminated(int error_code);
     void on_connection_status_update(int status);
@@ -120,6 +121,7 @@ private:
     mutable std::mutex events_mu_;
     std::deque<SessionEvent> events_;
     std::string stage_text_ = "init";
+    std::string last_log_;
 
     std::atomic<uint32_t> rx_count_{0};
     std::atomic<uint32_t> dec_count_{0};

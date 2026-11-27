@@ -7,11 +7,19 @@
 #include "worker_queue.hpp"
 
 #include <atomic>
-#include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <future>
 #include <iostream>
 #include <vector>
+
+#undef assert
+#define assert(cond) do { \
+    if (!(cond)) { \
+        std::cerr << "Assertion failed: " #cond " at " << __FILE__ << ":" << __LINE__ << "\n"; \
+        std::abort(); \
+    } \
+} while (0)
 
 using namespace nightjar::frame_warp;
 using namespace nightjar::tizen;

@@ -31,7 +31,7 @@ std::string build_video_mime(const std::string& codec, uint32_t width, uint32_t 
         const char* level = "2A";
         if (pixels <= 1920ull * 1080ull && fps <= 60u) {
             level = "2A";
-        } else if (pixel_rate <= 2560ull * 1440ull * 60ull + 1000000ull) {
+        } else if (pixel_rate <= 1920ull * 1080ull * 120ull) {
             level = "32";
         } else {
             level = "34";
@@ -46,7 +46,7 @@ std::string build_video_mime(const std::string& codec, uint32_t width, uint32_t 
     const char* level = "L153";
     if (pixels <= 1920ull * 1080ull && fps <= 60u) {
         level = "L123";
-    } else if (pixel_rate <= 2560ull * 1440ull * 60ull + 1000000ull) {
+    } else if (pixel_rate <= 1920ull * 1080ull * 120ull) {
         level = "L150";
     } else if (pixel_rate <= 3840ull * 2160ull * 60ull) {
         level = "L153";

@@ -364,17 +364,21 @@ void FrameWarp::note_mouse(int16_t dx, int16_t dy, uint64_t now_us) {
     if (dx != 0 || dy != 0) input_seq_.fetch_add(1u, std::memory_order_acq_rel);
 }
 
-void FrameWarp::note_controller(uint16_t number, int16_t rx, int16_t ry, uint64_t now_us) {
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        predictor_.note_controller(number, rx, ry, now_us);
-    }
+void FrameWarp::note_local_stick(uint16_t number, int16_t rx, int16_t ry) {
     if (controller_.has_value() && static_cast<uint16_t>(*controller_) == number) {
         uint32_t packed = (static_cast<uint32_t>(static_cast<uint16_t>(rx)) << 16) |
                           static_cast<uint32_t>(static_cast<uint16_t>(ry));
         stick_packed_.store(packed, std::memory_order_release);
         input_seq_.fetch_add(1u, std::memory_order_acq_rel);
     }
+}
+
+void FrameWarp::note_controller(uint16_t number, int16_t rx, int16_t ry, uint64_t now_us) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        predictor_.note_controller(number, rx, ry, now_us);
+    }
+    note_local_stick(number, rx, ry);
 }
 
 void FrameWarp::on_model(const Model& model) {

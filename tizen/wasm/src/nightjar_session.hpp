@@ -101,6 +101,7 @@ public:
     void on_connection_terminated(int error_code);
     void on_connection_status_update(int status);
     void on_control_packet(uint16_t msg_type, const uint8_t* payload, size_t len);
+    void on_controller_wire_packet(uint16_t controller_idx, int16_t rx, int16_t ry);
     int on_video_decode_unit(
         const uint8_t* data,
         size_t len,
@@ -160,6 +161,7 @@ private:
     std::unique_ptr<TizenVideoDecoder> decoder_;
     std::unique_ptr<TizenAudioDecoder> audio_decoder_;
     WarpGlRenderer renderer_;
+    std::mutex decode_buf_mu_;
     std::vector<uint8_t> decode_buf_;
 
     std::atomic<bool> running_{false};

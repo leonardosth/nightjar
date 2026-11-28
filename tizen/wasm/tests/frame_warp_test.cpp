@@ -250,6 +250,32 @@ int main() {
         assert(!q.resolve(std::nullopt).has_value());
     }
 
+    // 16. TizenVideoDecoder anchors real 85 fps host PTS deltas at 0.0s instead of synthetic 120 fps grid
+    {
+        auto fw = std::make_shared<FrameWarp>(0, 1024);
+        TizenVideoDecoder dec(fw);
+        VideoConfig cfg;
+        cfg.codec = "av1";
+        cfg.width = 3840;
+        cfg.height = 2160;
+        cfg.fps = 120;
+        cfg.use_video_texture = true;
+        assert(dec.initialize(cfg));
+
+        const uint8_t au[4] = {0x12, 0x00, 0x01, 0x02};
+        // First packet starts with non-zero host PTS 250000us -> anchored at 0us; subsequent 85fps (~11765us) deltas preserved
+        assert(dec.submit_access_unit(au, sizeof(au), 10, 250000, true));
+        assert(dec.submit_access_unit(au, sizeof(au), 11, 261765, false));
+        assert(dec.submit_access_unit(au, sizeof(au), 12, 273530, false));
+
+        assert(fw->lookup_frame_pts_nearest(0, 1000) == 10u);
+        assert(fw->lookup_frame_pts_nearest(11765, 1000) == 11u);
+        assert(fw->lookup_frame_pts_nearest(23530, 1000) == 12u);
+        // Synthetic 120fps grid would have placed frame 12 at 16666us (6864us away from 23530us)
+        assert(!fw->lookup_frame_pts_nearest(16666, 2000).has_value());
+        dec.shutdown();
+    }
+
     // 14. TizenAudioDecoder::open_track_on_main_thread and reconfigure_opus are split cleanly
     {
         TizenAudioDecoder audio;

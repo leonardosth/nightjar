@@ -124,11 +124,17 @@ public:
 
 private:
     void kick_fill();
+    void reset_pts_origin();
 
     std::shared_ptr<frame_warp::FrameWarp> warp_;
     VideoConfig config_;
     bool initialized_ = false;
     uint64_t submitted_packets_ = 0;
+    std::mutex pts_mu_;
+    bool has_pts_origin_ = false;
+    int64_t pts_origin_us_ = 0;
+    uint64_t wall_origin_us_ = 0;
+    int64_t last_pts_us_ = 0;
     std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
     TextureRing ring_;
     PendingFrameQueue pending_;

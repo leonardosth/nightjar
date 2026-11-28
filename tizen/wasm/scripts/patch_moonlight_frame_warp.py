@@ -50,6 +50,17 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len);
         h_text = replace_exact(h_text, end_anchor, h_add, "Limelight.h end anchor")
         limelight_h.write_text(h_text, encoding="utf-8")
         print(f"Patched {limelight_h}")
+    if "LiSetFrameWarpControllerCallback" not in h_text:
+        end_anchor = "#ifdef __cplusplus\n}\n#endif"
+        ctrl_add = """typedef void (*FrameWarpControllerWireCallback)(uint16_t controllerNumber, int16_t rightStickX, int16_t rightStickY);
+void LiSetFrameWarpControllerCallback(FrameWarpControllerWireCallback callback);
+
+#ifdef __cplusplus
+}
+#endif"""
+        h_text = replace_exact(h_text, end_anchor, ctrl_add, "Limelight.h controller wire anchor")
+        limelight_h.write_text(h_text, encoding="utf-8")
+        print(f"Patched {limelight_h} (controller wire)")
 
     # 2. RtspConnection.c — strict token parse of 0x5543 on a=x-rl-control + WASI ECONNREFUSED retry
     rtsp_path = src / "RtspConnection.c"
@@ -276,6 +287,46 @@ int LiSendFrameWarpRequest(const uint8_t* payload, size_t len) {
             )
             enet_unix.write_text(eu_text, encoding="utf-8")
             print(f"Patched {enet_unix}")
+
+
+    # 6. InputStream.c — exact wire controller packet hook for Frame Warp stick seq sync
+    inp_path = src / "InputStream.c"
+    if inp_path.exists():
+        inp_text = inp_path.read_text(encoding="utf-8")
+        if "NIGHTJAR_TIZEN_INPUT_WIRE_PATCH" not in inp_text:
+            inp_text = "/* NIGHTJAR_TIZEN_INPUT_WIRE_PATCH */\n" + inp_text
+            inp_header = (
+                '#include "Limelight-internal.h"\n'
+                "static FrameWarpControllerWireCallback g_frameWarpControllerCallback = NULL;\n"
+                "void LiSetFrameWarpControllerCallback(FrameWarpControllerWireCallback callback) { g_frameWarpControllerCallback = callback; }\n"
+            )
+            inp_text = replace_exact(inp_text, '#include "Limelight-internal.h"', inp_header, "InputStream.c include")
+            inp_anchor = (
+                "            if (holder == currentQueuedControllerPacket[controllerNumber]) {\n"
+                "                currentQueuedControllerPacket[controllerNumber] = NULL;\n"
+                "            }\n"
+                "\n"
+                "            PltUnlockMutex(&batchedInputMutex);"
+            )
+            inp_replacement = (
+                "            short fwRx = 0;\n"
+                "            short fwRy = 0;\n"
+                "            if (holder == currentQueuedControllerPacket[controllerNumber]) {\n"
+                "                currentQueuedControllerPacket[controllerNumber] = NULL;\n"
+                "            }\n"
+                "            if (AppVersionQuad[0] > 3 && controllerNumber >= 0) {\n"
+                "                fwRx = (short)LE16(holder->packet.multiController.rightStickX);\n"
+                "                fwRy = (short)LE16(holder->packet.multiController.rightStickY);\n"
+                "            }\n"
+                "\n"
+                "            PltUnlockMutex(&batchedInputMutex);\n"
+                "            if (g_frameWarpControllerCallback != NULL && AppVersionQuad[0] > 3 && controllerNumber >= 0) {\n"
+                "                g_frameWarpControllerCallback((uint16_t)controllerNumber, fwRx, fwRy);\n"
+                "            }"
+            )
+            inp_text = replace_exact(inp_text, inp_anchor, inp_replacement, "InputStream.c controller wire send anchor")
+            inp_path.write_text(inp_text, encoding="utf-8")
+            print(f"Patched {inp_path}")
 
 
 if __name__ == "__main__":

@@ -64,6 +64,10 @@ void cb_frame_warp_packet(uint16_t msg_type, const uint8_t* data, size_t len) {
     if (auto* s = active_session()) s->on_control_packet(msg_type, data, len);
 }
 
+void cb_frame_warp_controller_wire(uint16_t controller_idx, int16_t rx, int16_t ry) {
+    if (auto* s = active_session()) s->on_controller_wire_packet(controller_idx, rx, ry);
+}
+
 int cb_video_setup(int /*video_format*/, int /*width*/, int /*height*/, int /*redraw_rate*/, void* /*ctx*/, int /*dr_flags*/) {
     return 0;
 }
@@ -367,6 +371,7 @@ bool NightjarSession::connect_on_worker_thread(std::string& out_error) {
     ar.capabilities = CAPABILITY_DIRECT_SUBMIT;
 
     LiSetFrameWarpCallback(cb_frame_warp_packet);
+    LiSetFrameWarpControllerCallback(cb_frame_warp_controller_wire);
     int rc = LiStartConnection(&li_server, &sc, &cl, &dr, &ar, nullptr, 0, nullptr, 0);
     if (rc != 0) {
         {
@@ -397,6 +402,7 @@ void NightjarSession::stop_network_on_worker() {
     }
     if (was_active) {
         LiSetFrameWarpCallback(nullptr);
+        LiSetFrameWarpControllerCallback(nullptr);
         LiStopConnection();
     }
 #endif
@@ -525,6 +531,12 @@ void NightjarSession::on_control_packet(uint16_t msg_type, const uint8_t* payloa
     }
 }
 
+void NightjarSession::on_controller_wire_packet(uint16_t controller_idx, int16_t rx, int16_t ry) {
+    if (warp_) {
+        warp_->note_controller(controller_idx, rx, ry, now_us());
+    }
+}
+
 int NightjarSession::on_video_decode_unit(
     const uint8_t* data,
     size_t len,
@@ -552,7 +564,22 @@ int NightjarSession::on_video_decode_unit(
         last_rx_frame_ = frame_number;
     }
 
-    bool ok = decoder_->submit_access_unit(data, len, frame_number, pts_us, keyframe);
+    const uint8_t* submit_data = data;
+    size_t submit_len = len;
+    if (opts_.codec == "av1" && data && len >= 2 && (data[0] != 0x12u || data[1] != 0x00u)) {
+        std::lock_guard<std::mutex> lk(decode_buf_mu_);
+        decode_buf_.clear();
+        if (decode_buf_.capacity() < len + 2u) {
+            decode_buf_.reserve(len + 2u);
+        }
+        decode_buf_.push_back(0x12u);
+        decode_buf_.push_back(0x00u);
+        decode_buf_.insert(decode_buf_.end(), data, data + len);
+        submit_data = decode_buf_.data();
+        submit_len = decode_buf_.size();
+    }
+
+    bool ok = decoder_->submit_access_unit(submit_data, submit_len, frame_number, pts_us, keyframe);
     if (ok && decoder_->is_direct_scanout()) {
         dec_count_.fetch_add(1u, std::memory_order_relaxed);
     }
@@ -626,8 +653,8 @@ void NightjarSession::send_controller_packet(
     int16_t rx,
     int16_t ry) {
     if (!running_.load(std::memory_order_acquire)) return;
-    if (warp_) warp_->note_controller(controller_idx, rx, ry, now_us());
 #ifdef NIGHTJAR_HAVE_MOONLIGHT
+    if (warp_) warp_->note_local_stick(controller_idx, rx, ry);
     LiSendMultiControllerEvent(
         static_cast<short>(controller_idx),
         static_cast<short>(active_mask),
@@ -639,6 +666,7 @@ void NightjarSession::send_controller_packet(
         rx,
         ry);
 #else
+    if (warp_) warp_->note_controller(controller_idx, rx, ry, now_us());
     (void)active_mask; (void)button_flags; (void)left_trigger; (void)right_trigger; (void)lx; (void)ly;
 #endif
 }
@@ -793,7 +821,7 @@ bool NightjarSession::rtsp_frame_warp_control() const {
 }
 
 std::string NightjarSession::fw_state(const frame_warp::Status& st) const {
-    if (!opts_.use_video_texture) return "direct";
+    if (!opts_.use_video_texture) return opts_.hdr ? "hdr-direct" : "direct";
     if (!opts_.frame_warp_enabled) return "off";
     if (!running_.load(std::memory_order_acquire)) return "connecting";
     if (host_frame_warp_version_ < 1) return "host-no-fw";

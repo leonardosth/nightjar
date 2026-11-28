@@ -1,6 +1,7 @@
 #include "tizen_video_decoder.hpp"
 #include "codec_capabilities.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
@@ -143,6 +144,7 @@ struct TizenVideoDecoder::Impl
     bool hdr10 = false;
     std::function<void()> on_need_idr;
     std::function<void(void*)> on_source_ready_for_tracks;
+    std::function<void()> on_track_closed;
     TextureRing* ring_ref = nullptr;
     PendingFrameQueue* pending_ref = nullptr;
 
@@ -230,6 +232,7 @@ struct TizenVideoDecoder::Impl
         track_open.store(false, std::memory_order_release);
         if (ring_ref) ring_ref->reset();
         if (pending_ref) pending_ref->clear();
+        if (on_track_closed) on_track_closed();
     }
 
     void OnSessionIdChanged(samsung::wasm::SessionId new_id) override {
@@ -250,11 +253,20 @@ TizenVideoDecoder::~TizenVideoDecoder() {
     shutdown();
 }
 
+void TizenVideoDecoder::reset_pts_origin() {
+    std::lock_guard<std::mutex> lk(pts_mu_);
+    has_pts_origin_ = false;
+    pts_origin_us_ = 0;
+    wall_origin_us_ = 0;
+    last_pts_us_ = 0;
+}
+
 bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_error) {
     shutdown();
     alive_ = std::make_shared<std::atomic<bool>>(true);
     config_ = config;
     submitted_packets_ = 0;
+    reset_pts_origin();
     pending_.clear();
     decode_latency_.roll();
     decoded_total_.store(0, std::memory_order_relaxed);
@@ -268,6 +280,7 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_e
 
     impl_->on_need_idr = config.on_need_idr;
     impl_->on_source_ready_for_tracks = config.on_source_ready_for_tracks;
+    impl_->on_track_closed = [this]() { reset_pts_origin(); };
     impl_->ring_ref = &ring_;
     impl_->pending_ref = &pending_;
     impl_->use_video_texture = config.use_video_texture;
@@ -343,7 +356,7 @@ bool TizenVideoDecoder::register_gl_context() {
 }
 
 bool TizenVideoDecoder::submit_access_unit(
-    const uint8_t* data, size_t size, uint32_t frame_number, int64_t /*pts_us*/, bool keyframe) {
+    const uint8_t* data, size_t size, uint32_t frame_number, int64_t pts_us, bool keyframe) {
     if (!initialized_ || !data || size == 0) return false;
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
@@ -352,10 +365,35 @@ bool TizenVideoDecoder::submit_access_unit(
     }
 #endif
 
-    // Purely synthetic monotonic PTS anchored at 0.0s matching audio track's 0.0s clock
+    // Anchor video PTS at 0.0s (matching the Opus audio track) using real host frame timing
+    // so variable-FPS games (e.g. 85 fps inside a 120 fps stream) never drift behind audio.
     const uint32_t fps = config_.fps ? config_.fps : 60u;
     const int64_t frame_dur_us = 1000000LL / static_cast<int64_t>(fps);
-    const int64_t effective_pts_us = static_cast<int64_t>(submitted_packets_) * frame_dur_us;
+    const uint64_t now_wall_us = steady_now_us();
+    int64_t effective_pts_us = 0;
+    int64_t pkt_dur_us = frame_dur_us;
+    {
+        std::lock_guard<std::mutex> lk(pts_mu_);
+        if (!has_pts_origin_) {
+            has_pts_origin_ = true;
+            pts_origin_us_ = pts_us;
+            wall_origin_us_ = now_wall_us;
+            last_pts_us_ = 0;
+            effective_pts_us = 0;
+        } else {
+            int64_t candidate_us = 0;
+            if (pts_us > pts_origin_us_) {
+                candidate_us = pts_us - pts_origin_us_;
+            } else if (now_wall_us > wall_origin_us_) {
+                candidate_us = static_cast<int64_t>(now_wall_us - wall_origin_us_);
+            } else {
+                candidate_us = last_pts_us_ + frame_dur_us;
+            }
+            effective_pts_us = std::max(last_pts_us_ + 500LL, candidate_us);
+            pkt_dur_us = std::clamp<int64_t>(effective_pts_us - last_pts_us_, 1000LL, 100000LL);
+            last_pts_us_ = effective_pts_us;
+        }
+    }
     ++submitted_packets_;
 
     if (warp_) {
@@ -364,7 +402,7 @@ bool TizenVideoDecoder::submit_access_unit(
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     samsung::wasm::Seconds pts(static_cast<double>(effective_pts_us) / 1000000.0);
-    samsung::wasm::Seconds dur(1.0 / static_cast<double>(fps));
+    samsung::wasm::Seconds dur(static_cast<double>(pkt_dur_us) / 1000000.0);
     samsung::wasm::ElementaryMediaPacket pkt{
         pts,
         pts,
@@ -424,12 +462,13 @@ void TizenVideoDecoder::kick_fill() {
                 const uint64_t now = steady_now_us();
                 const uint32_t fps = config_.fps ? config_.fps : 60u;
                 const int64_t half_frame_us = 500000LL / static_cast<int64_t>(fps);
+                const int64_t tol_us = std::max<int64_t>(half_frame_us, 10000LL);
                 std::optional<uint32_t> hint;
                 if (impl_->media_element && warp_) {
                     auto t_res = impl_->media_element->GetCurrentTime();
                     if (t_res) {
                         int64_t cur_pts_us = static_cast<int64_t>(std::llround(t_res.value.count() * 1000000.0));
-                        hint = warp_->lookup_frame_pts_nearest(cur_pts_us, half_frame_us);
+                        hint = warp_->lookup_frame_pts_nearest(cur_pts_us, tol_us);
                     }
                 }
                 uint32_t resolved_frame = 0;
@@ -513,6 +552,7 @@ void TizenVideoDecoder::shutdown() {
     initialized_ = false;
     ring_.reset();
     pending_.clear();
+    reset_pts_origin();
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     if (impl_) {
         if (impl_->has_track) {

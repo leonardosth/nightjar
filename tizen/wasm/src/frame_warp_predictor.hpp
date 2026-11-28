@@ -125,6 +125,7 @@ public:
 
     FrameWarpRequest request(bool enabled, bool lens = true);
     void note_mouse(int16_t dx, int16_t dy, uint64_t now_us);
+    void note_local_stick(uint16_t number, int16_t rx, int16_t ry);
     void note_controller(uint16_t number, int16_t rx, int16_t ry, uint64_t now_us);
     void on_model(const Model& model);
     void on_tags(const Tags& tags, uint64_t now_us);

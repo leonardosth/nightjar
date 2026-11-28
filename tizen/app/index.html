@@ -25,6 +25,7 @@
           <button class="nav-tab focusable" data-tab="framewarp" data-i18n="tab.lab" tabindex="0">Frame Warp Lab</button>
         </nav>
         <div class="status-pills">
+          <span id="video-profile-pill" class="pill pill-ok"></span>
           <span id="wasm-status-pill" class="pill pill-warn" data-i18n="pill.wasmChecking">Engine: Checking…</span>
           <span id="gamepad-status-pill" class="pill" data-i18n="pill.padNone">Gamepad: None</span>
         </div>
@@ -166,6 +167,7 @@
         <span><strong>Enter / A</strong> <span data-i18n="footer.select">Select</span></span>
         <span><strong>Back / B</strong> <span data-i18n="footer.back">Return</span></span>
         <span><strong>Menu / LB+RB+Start+Back</strong> <span data-i18n="footer.menu">Stream Menu</span></span>
+        <span><strong>Hold Start</strong> <span data-i18n="footer.mouse">Mouse Mode</span></span>
       </footer>
     </div>
 
@@ -212,12 +214,15 @@
         <div id="ov-rows"></div>
       </aside>
 
+      <div id="mouse-mode-toast" class="stream-toast hidden"></div>
+
       <!-- Stream Menu Overlay -->
       <div id="stream-menu" class="modal hidden">
         <div class="modal-card">
           <h3 data-i18n="menu.title">Stream Menu</h3>
           <div class="menu-stack">
             <button id="btn-sm-toggle-fw" class="btn btn-secondary focusable">Frame Warp: ON</button>
+            <button id="btn-sm-toggle-mouse" class="btn btn-secondary focusable">Controller Mouse: OFF</button>
             <button id="btn-sm-toggle-overlay" class="btn btn-secondary focusable">Overlay: OFF</button>
             <button id="btn-sm-resume" class="btn btn-primary focusable" data-i18n="menu.resume">Resume Stream</button>
             <button id="btn-sm-disconnect" class="btn btn-danger focusable" data-i18n="menu.disconnect">Disconnect</button>

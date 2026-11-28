@@ -87,10 +87,12 @@ class NightjarTizenApp {
     this._busy = false;
     this._userNavigated = false;
     this._ovRowMap = new Map();
+    this._mouseToastTimer = null;
 
     this._bindElements();
     this._applyLocale();
     this._syncSettingsToDom();
+    this._updateProfilePill();
     this._renderHome();
     this._initInput();
     this._bindLifecycle();
@@ -119,6 +121,7 @@ class NightjarTizenApp {
     this.elAppsSection = document.getElementById('apps-section');
     this.elAppsHeading = document.getElementById('apps-heading');
     this.elAppsRow = document.getElementById('apps-row');
+    this.elProfilePill = document.getElementById('video-profile-pill');
     this.elWasmPill = document.getElementById('wasm-status-pill');
     this.elPadPill = document.getElementById('gamepad-status-pill');
     this.elAddModal = document.getElementById('add-host-modal');
@@ -126,6 +129,7 @@ class NightjarTizenApp {
     this.elStreamMenu = document.getElementById('stream-menu');
     this.elOverlay = document.getElementById('stream-overlay');
     this.elOvRows = document.getElementById('ov-rows');
+    this.elMouseToast = document.getElementById('mouse-mode-toast');
 
     document.querySelectorAll('.nav-tab').forEach((btn) => {
       btn.addEventListener('click', () => this.switchTab(btn.dataset.tab));
@@ -138,8 +142,17 @@ class NightjarTizenApp {
 
     document.getElementById('btn-sm-toggle-fw').addEventListener('click', () => {
       this.settings.fwEnabled = !this.settings.fwEnabled;
+      if (this.settings.fwEnabled) this.settings.hdr = false;
+      this._syncSettingsToDom();
       this._saveSettings();
+      this._updateProfilePill();
       if (this.session) this.session.setFrameWarpEnabled(this.settings.fwEnabled);
+      this._updateStreamMenuLabels();
+    });
+    document.getElementById('btn-sm-toggle-mouse').addEventListener('click', () => {
+      if (this.input) {
+        this.input.setMouseModeActive(!this.input.isMouseModeActive());
+      }
       this._updateStreamMenuLabels();
     });
     document.getElementById('btn-sm-toggle-overlay').addEventListener('click', () => {
@@ -162,7 +175,15 @@ class NightjarTizenApp {
       if (!el) return;
       el.addEventListener('change', () => {
         this.settings[key] = isCheckbox ? el.checked : el.value;
+        if (key === 'hdr' && this.settings.hdr) {
+          this.settings.fwEnabled = false;
+          this._syncSettingsToDom();
+        } else if (key === 'fwEnabled' && this.settings.fwEnabled) {
+          this.settings.hdr = false;
+          this._syncSettingsToDom();
+        }
         this._saveSettings();
+        this._updateProfilePill();
       });
     };
     bindSetting('set-resolution', 'resolution');
@@ -192,6 +213,19 @@ class NightjarTizenApp {
     document.getElementById('set-surround51').checked = Boolean(this.settings.surround51);
     document.getElementById('set-fw-enabled').checked = Boolean(this.settings.fwEnabled);
     document.getElementById('set-overlay').checked = Boolean(this.settings.overlay);
+  }
+
+  _updateProfilePill() {
+    if (!this.elProfilePill) return;
+    const resMap = { '3840x2160': '4K', '2560x1440': '1440p', '1920x1080': '1080p' };
+    const resLabel = resMap[this.settings.resolution] || this.settings.resolution;
+    const modeLabel = this.settings.hdr
+      ? 'HDR10'
+      : this.settings.fwEnabled
+        ? 'Frame Warp'
+        : 'SDR Direct';
+    this.elProfilePill.textContent = `${resLabel}@${this.settings.fps} · ${String(this.settings.codec || 'hevc').toUpperCase()} · ${modeLabel}`;
+    this.elProfilePill.className = this.settings.hdr ? 'pill pill-warn' : 'pill pill-ok';
   }
 
   _saveSettings() {
@@ -286,7 +320,25 @@ class NightjarTizenApp {
           this.elPadPill.className = 'pill pill-ok';
         }
       },
+      onMouseModeChange: (_slot, active) => {
+        this._showMouseModeToast(active);
+        this._updateStreamMenuLabels();
+      },
     });
+  }
+
+  _showMouseModeToast(active) {
+    if (!this.elMouseToast) return;
+    if (this._mouseToastTimer) {
+      clearTimeout(this._mouseToastTimer);
+      this._mouseToastTimer = null;
+    }
+    this.elMouseToast.textContent = active ? this.t('toast.mouseOn') : this.t('toast.mouseOff');
+    this.elMouseToast.classList.remove('hidden');
+    this._mouseToastTimer = setTimeout(() => {
+      if (this.elMouseToast) this.elMouseToast.classList.add('hidden');
+      this._mouseToastTimer = null;
+    }, 2800);
   }
 
   _hasOpenModal() {
@@ -1024,6 +1076,7 @@ class NightjarTizenApp {
     this.elCanvas.style.display = isDemo ? 'none' : 'block';
     if (this.elDemoCanvas) this.elDemoCanvas.style.display = isDemo ? 'block' : 'none';
     this.elOverlay.classList.toggle('hidden', !this.settings.overlay);
+    if (this.elMouseToast) this.elMouseToast.classList.add('hidden');
     this.streamMenuOpen = false;
     this.elStreamMenu.classList.add('hidden');
     this.input.setStreaming(true, { demo: isDemo });
@@ -1052,6 +1105,11 @@ class NightjarTizenApp {
     setScreenSaverEnabled(true);
     this.streamMenuOpen = false;
     this.elStreamMenu.classList.add('hidden');
+    if (this.elMouseToast) this.elMouseToast.classList.add('hidden');
+    if (this._mouseToastTimer) {
+      clearTimeout(this._mouseToastTimer);
+      this._mouseToastTimer = null;
+    }
     this.input.setStreaming(false);
     this.elStream.classList.remove('active');
     this.elLauncher.classList.add('active');
@@ -1078,6 +1136,11 @@ class NightjarTizenApp {
   _updateStreamMenuLabels() {
     document.getElementById('btn-sm-toggle-fw').textContent =
       this.settings.fwEnabled ? this.t('menu.fwOn') : this.t('menu.fwOff');
+    const mouseBtn = document.getElementById('btn-sm-toggle-mouse');
+    if (mouseBtn) {
+      mouseBtn.textContent =
+        this.input && this.input.isMouseModeActive() ? this.t('menu.mouseOn') : this.t('menu.mouseOff');
+    }
     document.getElementById('btn-sm-toggle-overlay').textContent =
       this.settings.overlay ? this.t('menu.ovOn') : this.t('menu.ovOff');
   }

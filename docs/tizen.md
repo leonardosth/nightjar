@@ -14,17 +14,17 @@ Nightjar's Tizen TV port runs on **Samsung Smart TVs with Tizen OS 10** (Chromiu
 2. **Dual hardware video pipeline (`TizenVideoDecoder` + `WarpGlRenderer`)**:
    - Uses `samsung::wasm::ElementaryMediaStreamSource` in `LatencyMode::kUltraLow`.
    - **Frame Warp path (`RenderingMode::kVideoTexture`)**: decodes HEVC (up to Level 5.2 `hev1.1.6.L156.B0` for 4K120), AV1 (`av01.0.13M.08`), or H.264 directly into a **3-slot `GL_TEXTURE_EXTERNAL_OES` `TextureRing`** with chained `FillTextureWithNextFrame` calls so decoded frames never stall behind `requestAnimationFrame`. Frames are matched back to RTP `frameNumber`s via `HTMLMediaElement::GetCurrentTime()` + `FrameRing::lookup_nearest` with `PendingFrameQueue` FIFO fallback, keeping the displayed frame valid across 120 Hz inter-frame redraws until replaced.
-   - **Direct scanout / HDR10 path (`RenderingMode::kMediaElement`)**: when Frame Warp is off, not offered by the host, or HDR10 (10-bit Main10) is enabled, frames go straight to the hardware `<video id="tizen-video-sink">` plane with zero shader pass and native HDR10 metadata passthrough.
+   - **Direct scanout / HDR10 path (`RenderingMode::kMediaElement`)**: when Frame Warp is off, not offered by the host, or HDR10 (10-bit Main10) is enabled, frames go straight to the hardware `<video id="tizen-video-sink">` plane with zero shader pass and native HDR10 metadata passthrough. HDR10 and Frame Warp are mutually exclusive because Tizen's WebGL 1.0 `kVideoTexture` canvas is an 8-bit SDR surface (`fwState: hdr-direct` when HDR10 is active).
 3. **Low-latency Opus audio (`TizenAudioDecoder`)**:
    - Decodes stereo or 5.1 multistream Opus via `libopus` into `SampleFormat::kS16` PCM packets fed into a second `ElementaryMediaTrack` on the same `ElementaryMediaStreamSource`.
-4. **10-foot TV UI (`tizen/app/`)**:
-   - Localized in English (`en`) and Brazilian Portuguese (`pt-BR`), 1-click **Quick Start / Resume** Continue card, inline horizontal PC & App rows, compacted W3C-to-Moonlight controller slots (`assignControllerSlots`) with edge-triggered A/B navigation (`NavRepeat`), concurrent PIN pairing with cancellation, and Tizen screensaver suppression (`webapis.appcommon.setScreenSaver`).
+4. **10-foot TV UI & Controls (`tizen/app/`)**:
+   - Localized in English (`en`) and Brazilian Portuguese (`pt-BR`), 1-click **Quick Start / Resume** Continue card, inline horizontal PC & App rows, compacted W3C-to-Moonlight controller slots (`assignControllerSlots`) with edge-triggered A/B navigation (`NavRepeat`), Xbox **Hold Start (650 ms)** Mouse Mode (Left Stick cursor, A/RT left-click, B/LT right-click, X middle-click, D-Pad/Right Stick scroll), concurrent PIN pairing with cancellation, and Tizen screensaver suppression (`webapis.appcommon.setScreenSaver`).
 
 ---
 
 ## Building and Installing on Samsung S85F (Tizen OS 10)
 
-### 1. Build the WASM engine (Docker)
+### 1. Build the WASM engine (Docker or GitHub Actions)
 
 ```powershell
 mkdir tizen\app\wasm -Force
@@ -37,7 +37,7 @@ docker run --rm -v "${PWD}\tizen\app\wasm:/out" nightjar-tizen-wasm
 Enable Developer Mode on the TV (**Apps → `12345` → Developer Mode ON → enter PC IP → reboot TV**), then run:
 
 ```powershell
-.\tizen\build-wgt.ps1 -Profile <YOUR_TIZEN_PROFILE> -TvIp <TV_IP>
+.\tizen\build-wgt.ps1 -FetchLatestWasm -Profile <YOUR_TIZEN_PROFILE> -TvIp <TV_IP>
 ```
 
 ---

@@ -38,6 +38,18 @@ export function migrateSettings(raw) {
   merged.surround51 = Boolean(merged.surround51);
   merged.fwEnabled = Boolean(merged.fwEnabled);
   merged.overlay = Boolean(merged.overlay);
+  if (raw && typeof raw === 'object' && raw.hdr === true) {
+    if (raw.fwEnabled === true) {
+      // Legacy ambiguous config: prefer SDR Frame Warp so Frame Warp activates out of the box
+      merged.fwEnabled = true;
+      merged.hdr = false;
+    } else {
+      merged.hdr = true;
+      merged.fwEnabled = false;
+    }
+  } else if (merged.hdr && merged.fwEnabled) {
+    merged.hdr = false;
+  }
   return merged;
 }
 
@@ -116,14 +128,19 @@ export const STRINGS = Object.freeze({
     'menu.title': 'Stream Menu',
     'menu.fwOn': 'Frame Warp: ON',
     'menu.fwOff': 'Frame Warp: OFF',
+    'menu.mouseOn': 'Controller Mouse: ON',
+    'menu.mouseOff': 'Controller Mouse: OFF',
     'menu.ovOn': 'Overlay: ON',
     'menu.ovOff': 'Overlay: OFF',
     'menu.resume': 'Resume Stream',
     'menu.disconnect': 'Disconnect',
+    'toast.mouseOn': 'Mouse Mode ON · Left Stick: Move · A/RT: Left Click · B/LT: Right Click · Hold Start to exit',
+    'toast.mouseOff': 'Mouse Mode OFF · Gamepad restored',
     'footer.nav': 'Navigate',
     'footer.select': 'Select',
     'footer.back': 'Return',
     'footer.menu': 'Stream Menu',
+    'footer.mouse': 'Mouse Mode',
     'ov.session': 'Session',
     'ov.path': 'Path',
     'ov.pathGpu': 'GPU · Frame Warp',
@@ -158,7 +175,9 @@ export const STRINGS = Object.freeze({
     'ov.redraws': 'redraws/s',
     'ov.lead': 'lead',
     'ov.model': 'model',
+    'ov.mask': 'mask',
     'ov.fw.direct': 'Off (Direct Video)',
+    'ov.fw.hdr-direct': 'Off (HDR10 uses Direct Video)',
     'ov.fw.off': 'Disabled in settings',
     'ov.fw.connecting': 'Connecting…',
     'ov.fw.host-no-fw': 'Host has no Frame Warp',
@@ -242,14 +261,19 @@ export const STRINGS = Object.freeze({
     'menu.title': 'Menu do Stream',
     'menu.fwOn': 'Frame Warp: LIGADO',
     'menu.fwOff': 'Frame Warp: DESLIGADO',
+    'menu.mouseOn': 'Mouse no Controle: LIGADO',
+    'menu.mouseOff': 'Mouse no Controle: DESLIGADO',
     'menu.ovOn': 'Painel: LIGADO',
     'menu.ovOff': 'Painel: DESLIGADO',
     'menu.resume': 'Voltar ao Stream',
     'menu.disconnect': 'Desconectar',
+    'toast.mouseOn': 'Modo Mouse LIGADO · Analógico Esq.: Mover · A/RT: Esq. · B/LT: Dir. · Segure Start p/ sair',
+    'toast.mouseOff': 'Modo Mouse DESLIGADO · Controle restaurado',
     'footer.nav': 'Navegar',
     'footer.select': 'Selecionar',
     'footer.back': 'Voltar',
     'footer.menu': 'Menu do Stream',
+    'footer.mouse': 'Modo Mouse',
     'ov.session': 'Sessão',
     'ov.path': 'Caminho',
     'ov.pathGpu': 'GPU · Frame Warp',
@@ -284,7 +308,9 @@ export const STRINGS = Object.freeze({
     'ov.redraws': 'redesenhos/s',
     'ov.lead': 'avanço',
     'ov.model': 'modelo',
+    'ov.mask': 'máscara',
     'ov.fw.direct': 'Desligado (Vídeo direto)',
+    'ov.fw.hdr-direct': 'Desligado (HDR10 usa Vídeo direto)',
     'ov.fw.off': 'Desativado nas config.',
     'ov.fw.connecting': 'Conectando…',
     'ov.fw.host-no-fw': 'Host sem Frame Warp',

@@ -64,7 +64,7 @@ export function buildOverlayRows(st, t) {
 
   const fwTagsVal =
     s.tagsFps != null || s.tagsTotal != null
-      ? `${s.tagsFps ?? 0}/s · ${translate('ov.lead')} ${s.tagLead ?? 0} · ${translate('ov.model')} ${s.modelGen ?? 0} ${s.mouseLocked ? 'M' : '-'}/${s.stickLocked ? 'S' : '-'} · lag ${(Number.isFinite(s.lagMs) ? s.lagMs : 0).toFixed(1)} ms`
+      ? `${s.tagsFps ?? 0}/s · ${translate('ov.lead')} ${s.tagLead ?? 0} · ${translate('ov.model')} ${s.modelGen ?? 0} ${s.mouseLocked ? 'M' : '-'}/${s.stickLocked ? 'S' : '-'} · ${translate('ov.mask')} ${s.masksTotal ?? 0} (${s.maskCells ?? 0}) · lag ${(Number.isFinite(s.lagMs) ? s.lagMs : 0).toFixed(1)} ms`
       : '—';
 
   return [

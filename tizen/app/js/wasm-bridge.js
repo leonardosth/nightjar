@@ -216,6 +216,7 @@ export class WasmStreamSession {
     }
 
     let pollTick = 0;
+    let prevPbq = null;
     const pollOverlay = () => {
       if (this._stopped) return;
       if (typeof this.runtime.pollSessionEvents === 'function') {
@@ -243,6 +244,7 @@ export class WasmStreamSession {
       try {
         const st = JSON.parse(this.runtime.getFrameWarpStatus());
         let playbackQuality = null;
+        let renderedFps = st.renderedFps || 0;
         if (st.directScanout && video && typeof video.getVideoPlaybackQuality === 'function') {
           try {
             const q = video.getVideoPlaybackQuality();
@@ -250,6 +252,25 @@ export class WasmStreamSession {
               playbackQuality = {
                 totalVideoFrames: q.totalVideoFrames,
                 droppedVideoFrames: q.droppedVideoFrames || 0,
+              };
+              const nowMs = Date.now();
+              if (
+                prevPbq &&
+                nowMs > prevPbq.atMs &&
+                playbackQuality.totalVideoFrames >= prevPbq.total
+              ) {
+                const dtSec = (nowMs - prevPbq.atMs) / 1000;
+                const totDelta = playbackQuality.totalVideoFrames - prevPbq.total;
+                const dropDelta = Math.max(
+                  0,
+                  playbackQuality.droppedVideoFrames - prevPbq.dropped
+                );
+                renderedFps = Math.max(0, Math.round((totDelta - dropDelta) / dtSec));
+              }
+              prevPbq = {
+                atMs: nowMs,
+                total: playbackQuality.totalVideoFrames,
+                dropped: playbackQuality.droppedVideoFrames,
               };
             }
           } catch {
@@ -260,7 +281,7 @@ export class WasmStreamSession {
           session: `${this.host.name} (${this.settings.resolution}@${this.settings.fps} ${this.settings.codec.toUpperCase()}${st.hdrActive ? ' HDR' : ''})`,
           rxFps: st.rxFps || 0,
           decodedFps: st.decodedFps || 0,
-          renderedFps: st.renderedFps || 0,
+          renderedFps,
           directScanout: Boolean(st.directScanout),
           enabled: this.enabled && Boolean(st.negotiated),
           locked: Boolean(st.locked),
@@ -274,7 +295,7 @@ export class WasmStreamSession {
           stage: st.stage || '—',
           diag: st.diag || '—',
           playbackQuality,
-          raw: st,
+          raw: { ...st, renderedFps },
         });
       } catch {
         // ignore

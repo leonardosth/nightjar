@@ -8,6 +8,7 @@
  */
 
 import {
+  ControllerMouseEmulation,
   MOONLIGHT_BUTTONS,
   NavRepeat,
   assignControllerSlots,
@@ -68,6 +69,7 @@ export class InputManager {
     onControllerArrival,
     onControllerPacket,
     onGamepadStatus,
+    onMouseModeChange,
   }) {
     this.onNavigate = onNavigate;
     this.onBack = onBack;
@@ -80,6 +82,7 @@ export class InputManager {
     this.onControllerArrival = onControllerArrival;
     this.onControllerPacket = onControllerPacket;
     this.onGamepadStatus = onGamepadStatus;
+    this.onMouseModeChange = onMouseModeChange;
 
     this.streaming = false;
     this.demoMode = false;
@@ -90,6 +93,7 @@ export class InputManager {
     this._lastSentState = new Array(16).fill(null);
     this._navRepeats = Array.from({ length: 16 }, () => new NavRepeat());
     this._prevButtons = Array.from({ length: 16 }, () => ({ a: false, b: false }));
+    this._mouseEmu = new ControllerMouseEmulation();
     this._raf = null;
 
     this._registerTizenKeys();
@@ -291,6 +295,10 @@ export class InputManager {
 
         for (const { slot } of removed) {
           this._lastSentState[slot] = null;
+          const resetRes = this._mouseEmu.resetSlot(slot);
+          for (const mb of resetRes.mouseButtons) {
+            this.onMouseButton?.(mb.action, mb.button);
+          }
           this.onControllerPacket?.(slot, mask, {
             buttons: 0,
             leftTrigger: 0,
@@ -322,6 +330,36 @@ export class InputManager {
               this.onStreamMenu();
             }
             this.lastMenuChord = chord;
+
+            const mouseRes = this._mouseEmu.update(slot, mapped, now);
+            if (mouseRes.sendNeutralController) {
+              const neutral = {
+                buttons: 0,
+                leftTrigger: 0,
+                rightTrigger: 0,
+                leftStickX: 0,
+                leftStickY: 0,
+                rightStickX: 0,
+                rightStickY: 0,
+              };
+              this._lastSentState[slot] = { ...neutral, sentAt: now };
+              this.onControllerPacket?.(slot, mask, neutral);
+            }
+            for (const mb of mouseRes.mouseButtons) {
+              this.onMouseButton?.(mb.action, mb.button);
+            }
+            if (mouseRes.toggled) {
+              this.onMouseModeChange?.(slot, mouseRes.active);
+            }
+            if (mouseRes.active) {
+              if (mouseRes.dx !== 0 || mouseRes.dy !== 0) {
+                this.onMouseMove?.(mouseRes.dx, mouseRes.dy);
+              }
+              if (mouseRes.scrollClicks !== 0) {
+                this.onMouseWheel?.(mouseRes.scrollClicks);
+              }
+              continue;
+            }
 
             // Keep sending fresh right-stick samples while deflected for Frame Warp integration
             const stickDeflected =
@@ -371,7 +409,47 @@ export class InputManager {
     this._raf = requestAnimationFrame(poll);
   }
 
+  isMouseModeActive() {
+    return this._mouseEmu.anyActive();
+  }
+
+  setMouseModeActive(active) {
+    const slots = this._slotByPad.size > 0 ? Array.from(this._slotByPad.values()) : [0];
+    let activeMask = 0;
+    for (const s of slots) activeMask |= 1 << s;
+    for (const slot of slots) {
+      const res = this._mouseEmu.setActive(slot, active);
+      if (res.sendNeutralController) {
+        const neutral = {
+          buttons: 0,
+          leftTrigger: 0,
+          rightTrigger: 0,
+          leftStickX: 0,
+          leftStickY: 0,
+          rightStickX: 0,
+          rightStickY: 0,
+        };
+        this._lastSentState[slot] = { ...neutral, sentAt: performance.now() };
+        this.onControllerPacket?.(slot, activeMask || 1, neutral);
+      }
+      for (const mb of res.mouseButtons) {
+        this.onMouseButton?.(mb.action, mb.button);
+      }
+      if (res.toggled) {
+        this.onMouseModeChange?.(slot, res.active);
+      }
+    }
+  }
+
   setStreaming(active, { demo = false } = {}) {
+    if (!active) {
+      const resetRes = this._mouseEmu.resetAll();
+      for (const mb of resetRes.mouseButtons) {
+        this.onMouseButton?.(mb.action, mb.button);
+      }
+    } else {
+      this._mouseEmu.resetAll();
+    }
     this.streaming = active;
     this.demoMode = active && demo;
     this.menuOpen = false;
@@ -382,6 +460,12 @@ export class InputManager {
   }
 
   setMenuOpen(open) {
+    if (open) {
+      const rel = this._mouseEmu.releaseHeldButtons();
+      for (const mb of rel.mouseButtons) {
+        this.onMouseButton?.(mb.action, mb.button);
+      }
+    }
     this.menuOpen = Boolean(open);
     this.lastMenuChord = false;
     this._seedButtonEdges();

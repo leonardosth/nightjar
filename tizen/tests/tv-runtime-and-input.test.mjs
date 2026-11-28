@@ -12,6 +12,7 @@ import {
 } from '../app/js/wasm-bridge.js';
 import { InputManager, TIZEN_KEY_BACK } from '../app/js/input-manager.js';
 import {
+  ControllerMouseEmulation,
   MOONLIGHT_BUTTONS,
   NavRepeat,
   assignControllerSlots,
@@ -592,6 +593,22 @@ test('patch_moonlight_frame_warp.py applies Frame Warp v1 and Samsung Tizen Sock
       '}\n'
     );
 
+    await fs.writeFile(
+      path.join(tmp, 'src', 'InputStream.c'),
+      '#include "Limelight-internal.h"\n' +
+      'static void inputSendThreadProc(void* context) {\n' +
+      '    if (1) {\n' +
+      '        short controllerNumber = 0;\n' +
+      '        if (1) {\n' +
+      '            if (holder == currentQueuedControllerPacket[controllerNumber]) {\n' +
+      '                currentQueuedControllerPacket[controllerNumber] = NULL;\n' +
+      '            }\n\n' +
+      '            PltUnlockMutex(&batchedInputMutex);\n' +
+      '        }\n' +
+      '    }\n' +
+      '}\n'
+    );
+
     const scriptPath = path.resolve(
       path.dirname(fileURLToPath(import.meta.url)),
       '..',
@@ -607,6 +624,8 @@ test('patch_moonlight_frame_warp.py applies Frame Warp v1 and Samsung Tizen Sock
     const psPatched = await fs.readFile(path.join(tmp, 'src', 'PlatformSockets.c'), 'utf8');
     const enetPatched = await fs.readFile(path.join(tmp, 'enet', 'unix.c'), 'utf8');
     const rtspPatched = await fs.readFile(path.join(tmp, 'src', 'RtspConnection.c'), 'utf8');
+    const inpPatched = await fs.readFile(path.join(tmp, 'src', 'InputStream.c'), 'utf8');
+    const hPatched = await fs.readFile(path.join(tmp, 'src', 'Limelight.h'), 'utf8');
 
     assert.match(psPatched, /#if defined\(__EMSCRIPTEN__\)[\s\S]*return SOCKET_ERROR;/);
     assert.match(psPatched, /__WASI_ERRNO_AGAIN/);
@@ -614,6 +633,9 @@ test('patch_moonlight_frame_warp.py applies Frame Warp v1 and Samsung Tizen Sock
     assert.match(enetPatched, /__WASI_ERRNO_INPROGRESS/);
     assert.match(rtspPatched, /__WASI_ERRNO_CONNREFUSED/);
     assert.match(rtspPatched, /rlHasFrameWarpControl/);
+    assert.match(inpPatched, /NIGHTJAR_TIZEN_INPUT_WIRE_PATCH/);
+    assert.match(inpPatched, /g_frameWarpControllerCallback/);
+    assert.match(hPatched, /LiSetFrameWarpControllerCallback/);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -773,6 +795,160 @@ test('initialFocusKey and launchDecision cover all launcher focus and launch sta
   assert.equal(launchDecision({ paired: true, currentGame: 101 }, 101), 'resume');
   assert.equal(launchDecision({ paired: true, currentGame: 202 }, 101), 'confirm-quit');
   assert.equal(launchDecision({ paired: true, currentGame: 0 }, 101), 'launch');
+});
+
+test('ControllerMouseEmulation toggles on Start hold >= 650ms, ignores short tap, and maps stick/A/B/triggers/D-pad', () => {
+  const emu = new ControllerMouseEmulation();
+  const base = {
+    buttons: 0,
+    leftTrigger: 0,
+    rightTrigger: 0,
+    leftStickX: 0,
+    leftStickY: 0,
+    rightStickX: 0,
+    rightStickY: 0,
+  };
+
+  // Short tap on Start (< 650ms) does not toggle
+  let r = emu.update(0, { ...base, buttons: MOONLIGHT_BUTTONS.PLAY }, 100);
+  assert.equal(r.active, false);
+  r = emu.update(0, { ...base, buttons: MOONLIGHT_BUTTONS.PLAY }, 500);
+  assert.equal(r.active, false);
+  r = emu.update(0, base, 550);
+  assert.equal(r.active, false);
+
+  // Hold Start >= 650ms toggles ON and requests neutral controller packet
+  emu.update(0, { ...base, buttons: MOONLIGHT_BUTTONS.PLAY }, 1000);
+  r = emu.update(0, { ...base, buttons: MOONLIGHT_BUTTONS.PLAY }, 1660);
+  assert.equal(r.toggled, true);
+  assert.equal(r.active, true);
+  assert.equal(r.sendNeutralController, true);
+  emu.update(0, base, 1680);
+
+  // Left stick right + up (leftStickY > 0 in Moonlight means UP -> negative screen dy)
+  r = emu.update(0, { ...base, leftStickX: 32767, leftStickY: 32767 }, 1720);
+  assert.ok(r.dx > 0 && r.dy < 0, `Expected dx>0, dy<0; got dx=${r.dx}, dy=${r.dy}`);
+
+  // A presses left mouse button (1), RT also presses left (no duplicate), B presses right (3)
+  r = emu.update(0, { ...base, buttons: MOONLIGHT_BUTTONS.A | MOONLIGHT_BUTTONS.B }, 1740);
+  assert.deepEqual(r.mouseButtons, [
+    { action: 0x07, button: 1 },
+    { action: 0x07, button: 3 },
+  ]);
+
+  // Holding RT keeps left pressed when A is released; releasing RT releases left
+  r = emu.update(0, { ...base, rightTrigger: 200 }, 1760);
+  assert.deepEqual(r.mouseButtons, [{ action: 0x08, button: 3 }]);
+  r = emu.update(0, base, 1780);
+  assert.deepEqual(r.mouseButtons, [{ action: 0x08, button: 1 }]);
+
+  // LT presses right mouse button (3), D-pad up/down emits scroll clicks
+  r = emu.update(0, { ...base, leftTrigger: 200, buttons: MOONLIGHT_BUTTONS.UP }, 1800);
+  assert.deepEqual(r.mouseButtons, [{ action: 0x07, button: 3 }]);
+  assert.equal(r.scrollClicks, 1);
+
+  // Hold Start >= 650ms toggles OFF and releases held mouse buttons
+  emu.update(0, { ...base, buttons: MOONLIGHT_BUTTONS.PLAY, leftTrigger: 200 }, 2000);
+  // Start hold requires no other buttons pressed; release LT first, then hold Start
+  emu.update(0, base, 2020);
+  emu.update(0, { ...base, buttons: MOONLIGHT_BUTTONS.PLAY }, 2100);
+  r = emu.update(0, { ...base, buttons: MOONLIGHT_BUTTONS.PLAY, leftTrigger: 0 }, 2760);
+  assert.equal(r.toggled, true);
+  assert.equal(r.active, false);
+});
+
+test('InputManager integrates Xbox Start-hold mouse mode and separates menu chord from Start hold', () => {
+  const origWindow = globalThis.window;
+  const origNavigator = globalThis.navigator;
+  const origRAF = globalThis.requestAnimationFrame;
+  const origCAF = globalThis.cancelAnimationFrame;
+
+  const listeners = new Map();
+  let rafCb = null;
+  const pad = {
+    id: 'Xbox Wireless Controller',
+    mapping: 'standard',
+    connected: true,
+    axes: [0, 0, 0, 0],
+    buttons: Array.from({ length: 17 }, () => ({ pressed: false, value: 0 })),
+  };
+
+  try {
+    globalThis.window = { addEventListener(type, fn) { listeners.set(type, fn); } };
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { getGamepads: () => [pad] },
+    });
+    globalThis.requestAnimationFrame = (cb) => { rafCb = cb; return 1; };
+    globalThis.cancelAnimationFrame = () => {};
+
+    const moves = [];
+    const mouseBtns = [];
+    const packets = [];
+    const modeChanges = [];
+    let menuToggles = 0;
+
+    const mgr = new InputManager({
+      onNavigate: () => {},
+      onBack: () => {},
+      onStreamMenu: () => { menuToggles++; },
+      onMouseMove: (dx, dy) => moves.push([dx, dy]),
+      onMouseButton: (action, button) => mouseBtns.push({ action, button }),
+      onControllerPacket: (idx, mask, st) => packets.push({ idx, mask, st }),
+      onGamepadStatus: () => {},
+      onMouseModeChange: (slot, active) => modeChanges.push({ slot, active }),
+    });
+
+    mgr.setStreaming(true);
+
+    // Hold Start for 700ms -> activates Mouse Mode and sends neutral controller
+    pad.buttons[9].pressed = true;
+    rafCb(100);
+    rafCb(800);
+    assert.deepEqual(modeChanges, [{ slot: 0, active: true }]);
+    assert.equal(packets[packets.length - 1].st.buttons, 0);
+
+    // Deflect left stick right and press A -> emits mouseMove and mouseButton(0x07, 1), NOT controller packets
+    const pktCountBefore = packets.length;
+    pad.buttons[9].pressed = false;
+    pad.axes[0] = 1.0;
+    pad.buttons[0].pressed = true;
+    rafCb(830);
+    assert.equal(packets.length, pktCountBefore);
+    assert.ok(moves.some(([dx]) => dx > 0));
+    assert.deepEqual(mouseBtns, [{ action: 0x07, button: 1 }]);
+
+    // LB+RB+Start+Back chord opens stream menu and releases held mouse button
+    pad.buttons[4].pressed = true;
+    pad.buttons[5].pressed = true;
+    pad.buttons[8].pressed = true;
+    pad.buttons[9].pressed = true;
+    rafCb(850);
+    assert.equal(menuToggles, 1);
+
+    mgr.setMenuOpen(true);
+    assert.deepEqual(mouseBtns[mouseBtns.length - 1], { action: 0x08, button: 1 });
+    mgr.destroy();
+  } finally {
+    globalThis.window = origWindow;
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, value: origNavigator });
+    globalThis.requestAnimationFrame = origRAF;
+    globalThis.cancelAnimationFrame = origCAF;
+  }
+});
+
+test('migrateSettings enforces HDR10 vs Frame Warp mutual exclusion and hdr-direct status formats cleanly', () => {
+  const bothOn = migrateSettings({ hdr: true, fwEnabled: true });
+  assert.equal(bothOn.fwEnabled, true);
+  assert.equal(bothOn.hdr, false);
+
+  const hdrOnly = migrateSettings({ hdr: true });
+  assert.equal(hdrOnly.hdr, true);
+  assert.equal(hdrOnly.fwEnabled, false);
+
+  const rows = buildOverlayRows({ fwState: 'hdr-direct', masksTotal: 2, maskCells: 512, tagsFps: 60 }, (k) => k);
+  assert.equal(rows.find((r) => r.key === 'fw').value, 'ov.fw.hdr-direct');
+  assert.match(rows.find((r) => r.key === 'fwTags').value, /ov\.mask 2 \(512\)/);
 });
 
 

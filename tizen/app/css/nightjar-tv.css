@@ -655,3 +655,24 @@ html, body {
   color: var(--accent);
   font-weight: 700;
 }
+
+.stream-toast {
+  position: fixed;
+  bottom: 36px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(10, 12, 18, 0.9);
+  border: 2px solid var(--accent);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 12px 26px;
+  font-size: 16px;
+  font-weight: 600;
+  pointer-events: none;
+  z-index: 30;
+  white-space: nowrap;
+}
+
+.stream-toast.hidden {
+  display: none;
+}

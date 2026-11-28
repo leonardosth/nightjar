@@ -8,13 +8,37 @@
 param(
     [string]$Profile = "",
     [string]$TvIp = "",
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [switch]$FetchLatestWasm,
+    [string]$RunId = ""
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $AppDir = Join-Path $PSScriptRoot "app"
+$WasmDir = Join-Path $AppDir "wasm"
 $DistDir = Join-Path $PSScriptRoot "dist"
+
+if ($FetchLatestWasm -or $RunId -ne "") {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        throw "GitHub CLI (gh) is required to download WASM artifacts."
+    }
+    $TargetRunId = $RunId
+    if ($TargetRunId -eq "") {
+        $TargetRunId = (& gh run list -R leonardosth/nightjar --branch tizen --workflow tizen.yml --status success --limit 1 --json databaseId -q ".[0].databaseId")
+        if ($LASTEXITCODE -ne 0 -or -not $TargetRunId) {
+            throw "Failed to locate a successful tizen.yml GitHub Actions run."
+        }
+    }
+    Write-Host "==> Downloading nightjar-tizen-wasm from GitHub Actions run $TargetRunId..." -ForegroundColor Cyan
+    New-Item -ItemType Directory -Force -Path $WasmDir | Out-Null
+    & gh run download $TargetRunId -R leonardosth/nightjar -n nightjar-tizen-wasm -D $WasmDir
+    if ($LASTEXITCODE -ne 0) { throw "Failed to download nightjar-tizen-wasm artifact from run $TargetRunId." }
+}
+
+if (-not (Test-Path (Join-Path $WasmDir "nightjar_tizen.wasm"))) {
+    throw "Missing tizen/app/wasm/nightjar_tizen.wasm. Run with -FetchLatestWasm or build tizen/Dockerfile first."
+}
 
 if (-not $SkipTests) {
     Write-Host "==> Running Nightjar Tizen unit tests..." -ForegroundColor Cyan

@@ -245,3 +245,291 @@ export function pickSpatialFocus(rects, currentIndex, dir) {
 
   return bestIdx >= 0 ? bestIdx : currentIndex;
 }
+
+const MOUSE_BTN_LEFT = 1;
+const MOUSE_BTN_MIDDLE = 2;
+const MOUSE_BTN_RIGHT = 3;
+const MOUSE_PRESS = 0x07;
+const MOUSE_RELEASE = 0x08;
+
+export class ControllerMouseEmulation {
+  constructor({
+    holdStartMs = 650,
+    stickDeadzone = 0.12,
+    baseSpeedPxPerSec = 140,
+    maxSpeedPxPerSec = 1150,
+    triggerPress = 90,
+    triggerRelease = 65,
+    scrollRepeatMs = 120,
+  } = {}) {
+    this.holdStartMs = holdStartMs;
+    this.stickDeadzone = stickDeadzone;
+    this.baseSpeedPxPerSec = baseSpeedPxPerSec;
+    this.maxSpeedPxPerSec = maxSpeedPxPerSec;
+    this.triggerPress = triggerPress;
+    this.triggerRelease = triggerRelease;
+    this.scrollRepeatMs = scrollRepeatMs;
+    this._slots = new Map();
+  }
+
+  _slotState(slot) {
+    let s = this._slots.get(slot);
+    if (!s) {
+      s = {
+        active: false,
+        prevStart: false,
+        startDownAt: null,
+        startConsumed: false,
+        remX: 0,
+        remY: 0,
+        lastTickMs: 0,
+        heldMouseMask: 0,
+        suppressedButtons: 0,
+        suppressLt: false,
+        suppressRt: false,
+        ltActive: false,
+        rtActive: false,
+        lastScrollDir: 0,
+        lastScrollAt: 0,
+      };
+      this._slots.set(slot, s);
+    }
+    return s;
+  }
+
+  isActive(slot) {
+    return Boolean(this._slots.get(slot)?.active);
+  }
+
+  anyActive() {
+    for (const s of this._slots.values()) {
+      if (s.active) return true;
+    }
+    return false;
+  }
+
+  setActive(slot, active) {
+    const s = this._slotState(slot);
+    const next = Boolean(active);
+    if (s.active === next) {
+      return { toggled: false, active: s.active, sendNeutralController: false, mouseButtons: [] };
+    }
+    const mouseButtons = [];
+    if (!next) {
+      for (const btn of [MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT]) {
+        if ((s.heldMouseMask & (1 << btn)) !== 0) {
+          mouseButtons.push({ action: MOUSE_RELEASE, button: btn });
+        }
+      }
+      s.heldMouseMask = 0;
+      s.ltActive = false;
+      s.rtActive = false;
+    }
+    s.active = next;
+    s.startDownAt = null;
+    s.startConsumed = false;
+    s.remX = 0;
+    s.remY = 0;
+    s.lastTickMs = 0;
+    s.lastScrollDir = 0;
+    return {
+      toggled: true,
+      active: s.active,
+      sendNeutralController: s.active,
+      mouseButtons,
+    };
+  }
+
+  resetSlot(slot) {
+    const s = this._slots.get(slot);
+    const mouseButtons = [];
+    if (s) {
+      for (const btn of [MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT]) {
+        if ((s.heldMouseMask & (1 << btn)) !== 0) {
+          mouseButtons.push({ action: MOUSE_RELEASE, button: btn });
+        }
+      }
+      this._slots.delete(slot);
+    }
+    return { mouseButtons };
+  }
+
+  resetAll() {
+    const mouseButtons = [];
+    for (const slot of Array.from(this._slots.keys())) {
+      const res = this.resetSlot(slot);
+      mouseButtons.push(...res.mouseButtons);
+    }
+    return { mouseButtons };
+  }
+
+  releaseHeldButtons() {
+    const mouseButtons = [];
+    for (const s of this._slots.values()) {
+      for (const btn of [MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT]) {
+        if ((s.heldMouseMask & (1 << btn)) !== 0) {
+          mouseButtons.push({ action: MOUSE_RELEASE, button: btn });
+        }
+      }
+      s.heldMouseMask = 0;
+      s.ltActive = false;
+      s.rtActive = false;
+      s.remX = 0;
+      s.remY = 0;
+      s.lastTickMs = 0;
+      s.lastScrollDir = 0;
+    }
+    return { mouseButtons };
+  }
+
+  update(slot, mapped, nowMs) {
+    const s = this._slotState(slot);
+    const buttons = mapped.buttons | 0;
+    const lt = mapped.leftTrigger | 0;
+    const rt = mapped.rightTrigger | 0;
+    const startPressed = (buttons & MOONLIGHT_BUTTONS.PLAY) !== 0;
+    const chordBlocking =
+      (buttons & (MOONLIGHT_BUTTONS.LB | MOONLIGHT_BUTTONS.RB | MOONLIGHT_BUTTONS.BACK)) !== 0;
+    const otherButtons =
+      (buttons & ~MOONLIGHT_BUTTONS.PLAY) !== 0 || lt > this.triggerPress || rt > this.triggerPress;
+
+    let toggled = false;
+    let sendNeutralController = false;
+    const mouseButtons = [];
+
+    if (startPressed && !s.prevStart && !chordBlocking && !otherButtons) {
+      s.startDownAt = nowMs;
+      s.startConsumed = false;
+    } else if (!startPressed) {
+      s.startDownAt = null;
+      s.startConsumed = false;
+    } else if (startPressed && s.startDownAt !== null) {
+      if (chordBlocking || otherButtons) {
+        s.startDownAt = null;
+      } else if (!s.startConsumed && (nowMs - s.startDownAt) >= this.holdStartMs) {
+        s.startConsumed = true;
+        s.active = !s.active;
+        toggled = true;
+        if (s.active) {
+          sendNeutralController = true;
+          s.suppressedButtons =
+            buttons & (MOONLIGHT_BUTTONS.A | MOONLIGHT_BUTTONS.B | MOONLIGHT_BUTTONS.X);
+          s.suppressLt = lt >= this.triggerPress;
+          s.suppressRt = rt >= this.triggerPress;
+          s.ltActive = false;
+          s.rtActive = false;
+          s.remX = 0;
+          s.remY = 0;
+          s.lastTickMs = nowMs;
+          s.lastScrollDir = 0;
+          s.lastScrollAt = 0;
+        } else {
+          for (const btn of [MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT]) {
+            if ((s.heldMouseMask & (1 << btn)) !== 0) {
+              mouseButtons.push({ action: MOUSE_RELEASE, button: btn });
+            }
+          }
+          s.heldMouseMask = 0;
+          s.ltActive = false;
+          s.rtActive = false;
+          s.remX = 0;
+          s.remY = 0;
+        }
+      }
+    }
+    s.prevStart = startPressed;
+
+    if (!s.active) {
+      return {
+        active: false,
+        toggled,
+        sendNeutralController,
+        dx: 0,
+        dy: 0,
+        mouseButtons,
+        scrollClicks: 0,
+      };
+    }
+
+    s.suppressedButtons &= buttons;
+    if (lt < this.triggerRelease) s.suppressLt = false;
+    if (rt < this.triggerRelease) s.suppressRt = false;
+
+    s.rtActive =
+      !s.suppressRt && (s.rtActive ? rt >= this.triggerRelease : rt >= this.triggerPress);
+    s.ltActive =
+      !s.suppressLt && (s.ltActive ? lt >= this.triggerRelease : lt >= this.triggerPress);
+
+    const effButtons = buttons & ~s.suppressedButtons;
+    const leftWanted = (effButtons & MOONLIGHT_BUTTONS.A) !== 0 || s.rtActive;
+    const rightWanted = (effButtons & MOONLIGHT_BUTTONS.B) !== 0 || s.ltActive;
+    const middleWanted = (effButtons & MOONLIGHT_BUTTONS.X) !== 0;
+
+    const syncBtn = (btn, wanted) => {
+      const bit = 1 << btn;
+      const was = (s.heldMouseMask & bit) !== 0;
+      if (wanted !== was) {
+        if (wanted) s.heldMouseMask |= bit;
+        else s.heldMouseMask &= ~bit;
+        mouseButtons.push({ action: wanted ? MOUSE_PRESS : MOUSE_RELEASE, button: btn });
+      }
+    };
+    syncBtn(MOUSE_BTN_LEFT, leftWanted);
+    syncBtn(MOUSE_BTN_RIGHT, rightWanted);
+    syncBtn(MOUSE_BTN_MIDDLE, middleWanted);
+
+    const nx = (mapped.leftStickX || 0) / 32767;
+    const ny = -(mapped.leftStickY || 0) / 32767;
+    const r = Math.hypot(nx, ny);
+    const dtSec =
+      s.lastTickMs > 0 ? Math.max(0.001, Math.min(0.05, (nowMs - s.lastTickMs) / 1000)) : 1 / 60;
+    s.lastTickMs = nowMs;
+
+    let dx = 0;
+    let dy = 0;
+    if (r > this.stickDeadzone) {
+      const u = Math.min(1, (r - this.stickDeadzone) / (1 - this.stickDeadzone));
+      const speed = this.baseSpeedPxPerSec * u + this.maxSpeedPxPerSec * u * u * u;
+      s.remX += (nx / r) * speed * dtSec;
+      s.remY += (ny / r) * speed * dtSec;
+      dx = Math.trunc(s.remX);
+      dy = Math.trunc(s.remY);
+      s.remX -= dx;
+      s.remY -= dy;
+    } else {
+      s.remX = 0;
+      s.remY = 0;
+    }
+
+    let scrollDir = 0;
+    if ((buttons & MOONLIGHT_BUTTONS.UP) !== 0) scrollDir = 1;
+    else if ((buttons & MOONLIGHT_BUTTONS.DOWN) !== 0) scrollDir = -1;
+    else {
+      const ryNorm = (mapped.rightStickY || 0) / 32767;
+      if (ryNorm > 0.45) scrollDir = 1;
+      else if (ryNorm < -0.45) scrollDir = -1;
+    }
+
+    let scrollClicks = 0;
+    if (
+      scrollDir !== 0 &&
+      (scrollDir !== s.lastScrollDir || (nowMs - s.lastScrollAt) >= this.scrollRepeatMs)
+    ) {
+      scrollClicks = scrollDir;
+      s.lastScrollDir = scrollDir;
+      s.lastScrollAt = nowMs;
+    } else if (scrollDir === 0) {
+      s.lastScrollDir = 0;
+    }
+
+    return {
+      active: true,
+      toggled,
+      sendNeutralController,
+      dx,
+      dy,
+      mouseButtons,
+      scrollClicks,
+    };
+  }
+}

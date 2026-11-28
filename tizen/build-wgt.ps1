@@ -32,8 +32,15 @@ if ($FetchLatestWasm -or $RunId -ne "") {
     }
     Write-Host "==> Downloading nightjar-tizen-wasm from GitHub Actions run $TargetRunId..." -ForegroundColor Cyan
     New-Item -ItemType Directory -Force -Path $WasmDir | Out-Null
-    & gh run download $TargetRunId -R leonardosth/nightjar -n nightjar-tizen-wasm -D $WasmDir
-    if ($LASTEXITCODE -ne 0) { throw "Failed to download nightjar-tizen-wasm artifact from run $TargetRunId." }
+    $TmpWasmDir = Join-Path ([System.IO.Path]::GetTempPath()) ("nightjar-wasm-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $TmpWasmDir | Out-Null
+    try {
+        & gh run download $TargetRunId -R leonardosth/nightjar -n nightjar-tizen-wasm -D $TmpWasmDir
+        if ($LASTEXITCODE -ne 0) { throw "Failed to download nightjar-tizen-wasm artifact from run $TargetRunId." }
+        Copy-Item -Path (Join-Path $TmpWasmDir "*") -Destination $WasmDir -Recurse -Force
+    } finally {
+        Remove-Item -Path $TmpWasmDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if (-not (Test-Path (Join-Path $WasmDir "nightjar_tizen.wasm"))) {

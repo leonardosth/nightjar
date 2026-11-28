@@ -389,7 +389,7 @@ bool TizenVideoDecoder::submit_access_unit(
             } else {
                 candidate_us = last_pts_us_ + frame_dur_us;
             }
-            effective_pts_us = std::max(last_pts_us_ + 500LL, candidate_us);
+            effective_pts_us = std::max<int64_t>(last_pts_us_ + int64_t{500}, candidate_us);
             pkt_dur_us = std::clamp<int64_t>(effective_pts_us - last_pts_us_, 1000LL, 100000LL);
             last_pts_us_ = effective_pts_us;
         }

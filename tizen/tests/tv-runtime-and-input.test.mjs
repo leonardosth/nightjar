@@ -951,5 +951,73 @@ test('migrateSettings enforces HDR10 vs Frame Warp mutual exclusion and hdr-dire
   assert.match(rows.find((r) => r.key === 'fwTags').value, /ov\.mask 2 \(512\)/);
 });
 
+test('WasmStreamSession handles dynamic VideoTexture->Direct fallback and ov.fw.vt-rejected overlay status', async () => {
+  const rows = buildOverlayRows({ fwState: 'vt-rejected' }, (k) => k);
+  assert.equal(rows.find((r) => r.key === 'fw').value, 'ov.fw.vt-rejected');
+
+  const origDoc = globalThis.document;
+  const origSetInterval = globalThis.setInterval;
+  const origClearInterval = globalThis.clearInterval;
+  const canvas = { width: 1920, height: 1080, style: { display: '' } };
+  const video = {
+    className: 'video-sink-hidden',
+    getVideoPlaybackQuality: () => ({ totalVideoFrames: 600, droppedVideoFrames: 3 }),
+  };
+
+  try {
+    globalThis.document = {
+      getElementById(id) {
+        if (id === 'stream-canvas') return canvas;
+        if (id === 'tizen-video-sink') return video;
+        return null;
+      },
+    };
+    let intervalFn = null;
+    globalThis.setInterval = (fn) => {
+      intervalFn = fn;
+      return 42;
+    };
+    globalThis.clearInterval = () => {};
+
+    let statusCall = 0;
+    const runtime = {
+      prepareStreamMedia: () => true,
+      startAsyncJob: () => 1,
+      pollAsyncJob: () => JSON.stringify({ done: true, payload: { ok: true } }),
+      startStreamLoop: () => {},
+      pollSessionEvents: () => '[]',
+      getFrameWarpStatus: () => {
+        statusCall++;
+        return JSON.stringify({
+          directScanout: statusCall >= 2,
+          fwState: statusCall >= 2 ? 'vt-rejected' : 'connecting',
+          shownTotal: 0,
+        });
+      },
+    };
+
+    const sess = new WasmStreamSession(
+      runtime,
+      { name: 'PC', address: '192.168.0.1', frameWarpVersion: 1 },
+      1,
+      { resolution: '3840x2160', fps: 120, codec: 'av1', bitrate: 100, hdr: false, fwEnabled: true }
+    );
+    const reports = [];
+    await sess.start((s) => reports.push(s));
+    assert.equal(canvas.style.display, 'block');
+    for (let i = 0; i < 6; i++) intervalFn();
+    assert.equal(canvas.style.display, 'none');
+    assert.equal(video.className, 'video-sink-direct');
+    const latest = reports[reports.length - 1];
+    assert.equal(latest.raw.fwState, 'vt-rejected');
+    assert.equal(latest.raw.shownTotal, 597);
+    await sess.stop();
+  } finally {
+    globalThis.document = origDoc;
+    globalThis.setInterval = origSetInterval;
+    globalThis.clearInterval = origClearInterval;
+  }
+});
+
 
 

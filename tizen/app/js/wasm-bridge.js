@@ -243,8 +243,14 @@ export class WasmStreamSession {
       if (!shouldPollStats || !onStats || !this.runtime.getFrameWarpStatus) return;
       try {
         const st = JSON.parse(this.runtime.getFrameWarpStatus());
+        if (st.directScanout && this.useVideoTexture) {
+          this.useVideoTexture = false;
+          if (canvas) canvas.style.display = 'none';
+          if (video) video.className = 'video-sink-direct';
+        }
         let playbackQuality = null;
         let renderedFps = st.renderedFps || 0;
+        let shownTotal = st.shownTotal || 0;
         if (st.directScanout && video && typeof video.getVideoPlaybackQuality === 'function') {
           try {
             const q = video.getVideoPlaybackQuality();
@@ -253,6 +259,10 @@ export class WasmStreamSession {
                 totalVideoFrames: q.totalVideoFrames,
                 droppedVideoFrames: q.droppedVideoFrames || 0,
               };
+              shownTotal = Math.max(
+                0,
+                playbackQuality.totalVideoFrames - playbackQuality.droppedVideoFrames
+              );
               const nowMs = Date.now();
               if (
                 prevPbq &&
@@ -295,7 +305,7 @@ export class WasmStreamSession {
           stage: st.stage || '—',
           diag: st.diag || '—',
           playbackQuality,
-          raw: { ...st, renderedFps },
+          raw: { ...st, renderedFps, shownTotal },
         });
       } catch {
         // ignore

@@ -219,6 +219,7 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
     warp_ = std::make_shared<frame_warp::FrameWarp>(
         std::optional<uint8_t>(0),
         opts.frame_warp_mask_width);
+    media_clock_ = std::make_shared<SharedMediaClock>();
 
     if (opts.use_video_texture) {
         if (!renderer_.init(static_cast<int>(opts.width), static_cast<int>(opts.height))) {
@@ -228,6 +229,7 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
     }
 
     audio_decoder_ = std::make_unique<TizenAudioDecoder>();
+    audio_decoder_->set_media_clock(media_clock_);
     decoder_ = std::make_unique<TizenVideoDecoder>(warp_);
     VideoConfig vcfg;
     vcfg.codec = opts.codec;
@@ -236,10 +238,14 @@ bool NightjarSession::init_media_on_main_thread(const StreamOptions& opts, std::
     vcfg.fps = opts.fps;
     vcfg.hdr10 = opts.hdr;
     vcfg.use_video_texture = opts.use_video_texture;
+    vcfg.media_clock = media_clock_;
     vcfg.on_need_idr = []() {
 #ifdef NIGHTJAR_HAVE_MOONLIGHT
         LiRequestIdrFrame();
 #endif
+    };
+    vcfg.on_before_register_gl = [this]() {
+        renderer_.make_current();
     };
     const bool surround51 = opts.surround51;
     vcfg.on_source_ready_for_tracks = [this, surround51](void* emss_source_ptr) {
@@ -360,7 +366,7 @@ bool NightjarSession::connect_on_worker_thread(std::string& out_error) {
     LiInitializeVideoCallbacks(&dr);
     dr.setup = cb_video_setup;
     dr.submitDecodeUnit = cb_submit_decode_unit;
-    dr.capabilities = CAPABILITY_DIRECT_SUBMIT |
+    dr.capabilities = CAPABILITY_SLICES_PER_FRAME(4) |
                       CAPABILITY_REFERENCE_FRAME_INVALIDATION_HEVC |
                       CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1;
 
@@ -468,8 +474,9 @@ void NightjarSession::on_connection_started() {
         stage_text_ = "Connected";
     }
 #ifdef NIGHTJAR_HAVE_MOONLIGHT
+    const bool using_vt = decoder_ ? !decoder_->is_direct_scanout() : opts_.use_video_texture;
     // Strictly capability-gated: requires BOTH <FrameWarpVersion> >= 1 AND RTSP a=x-rl-control 0x5543
-    if (opts_.frame_warp_enabled && opts_.use_video_texture && host_frame_warp_version_ >= 1 && LiHasFrameWarpControl()) {
+    if (opts_.frame_warp_enabled && using_vt && host_frame_warp_version_ >= 1 && LiHasFrameWarpControl()) {
         send_frame_warp_request(true);
     }
 #endif
@@ -487,7 +494,8 @@ void NightjarSession::on_connection_status_update(int status) {
 void NightjarSession::set_frame_warp_enabled(bool enabled) {
     opts_.frame_warp_enabled = enabled;
 #ifdef NIGHTJAR_HAVE_MOONLIGHT
-    if (running_.load(std::memory_order_acquire) && opts_.use_video_texture &&
+    const bool using_vt = decoder_ ? !decoder_->is_direct_scanout() : opts_.use_video_texture;
+    if (running_.load(std::memory_order_acquire) && using_vt &&
         host_frame_warp_version_ >= 1 && LiHasFrameWarpControl()) {
         send_frame_warp_request(enabled);
     }
@@ -821,7 +829,9 @@ bool NightjarSession::rtsp_frame_warp_control() const {
 }
 
 std::string NightjarSession::fw_state(const frame_warp::Status& st) const {
-    if (!opts_.use_video_texture) return opts_.hdr ? "hdr-direct" : "direct";
+    if (decoder_ && decoder_->video_texture_rejected()) return "vt-rejected";
+    const bool direct = decoder_ ? decoder_->is_direct_scanout() : !opts_.use_video_texture;
+    if (direct) return opts_.hdr ? "hdr-direct" : "direct";
     if (!opts_.frame_warp_enabled) return "off";
     if (!running_.load(std::memory_order_acquire)) return "connecting";
     if (host_frame_warp_version_ < 1) return "host-no-fw";
@@ -851,7 +861,13 @@ std::string NightjarSession::stage_summary() const {
 }
 
 std::string NightjarSession::decoder_summary() const {
-    return decoder_ ? decoder_->diagnostic_summary() : "no-decoder";
+    std::string summary = decoder_ ? decoder_->diagnostic_summary() : "no-decoder";
+    if (audio_decoder_) {
+        summary += " ag=" + std::to_string(audio_decoder_->audio_gaps()) +
+                   " ad=" + std::to_string(audio_decoder_->audio_dropped()) +
+                   " al=" + std::to_string(audio_decoder_->audio_lead_ms());
+    }
+    return summary;
 }
 
 frame_warp::Status NightjarSession::frame_warp_status() const {

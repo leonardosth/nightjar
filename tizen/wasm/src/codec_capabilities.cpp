@@ -56,6 +56,37 @@ std::string build_video_mime(const std::string& codec, uint32_t width, uint32_t 
     return std::string("video/mp4; codecs=\"") + profile + "." + level + ".B0\"";
 }
 
+std::vector<VideoTrackCandidate> build_video_track_candidates(
+    const std::string& codec, uint32_t width, uint32_t height, uint32_t fps, bool hdr10) {
+    const uint32_t eff_fps = fps ? fps : 60u;
+    std::vector<VideoTrackCandidate> out;
+    auto push_unique = [&](const std::string& mime, uint32_t w, uint32_t h, uint32_t f) {
+        for (const auto& existing : out) {
+            if (existing.mime == mime && existing.width == w && existing.height == h && existing.fps == f) {
+                return;
+            }
+        }
+        out.push_back(VideoTrackCandidate{mime, w, h, f});
+    };
+
+    push_unique(build_video_mime(codec, width, height, eff_fps, hdr10), width, height, eff_fps);
+    if (eff_fps > 60u) {
+        push_unique(build_video_mime(codec, width, height, 60u, hdr10), width, height, 60u);
+    }
+    if (width <= 1920u && height <= 1080u) {
+        const char* base1080 = nullptr;
+        if (codec == "av1") {
+            base1080 = hdr10 ? "video/mp4; codecs=\"av01.0.08M.10\"" : "video/mp4; codecs=\"av01.0.08M.08\"";
+        } else if (codec == "h264") {
+            base1080 = "video/mp4; codecs=\"avc1.64002A\"";
+        } else {
+            base1080 = hdr10 ? "video/mp4; codecs=\"hev1.2.4.L123.B0\"" : "video/mp4; codecs=\"hev1.1.6.L123.B0\"";
+        }
+        push_unique(base1080, width, height, 60u);
+    }
+    return out;
+}
+
 bool sdp_offers_frame_warp(const std::string& sdp) {
     constexpr const char* kPrefix = "a=x-rl-control:";
     constexpr size_t kPrefixLen = 15;

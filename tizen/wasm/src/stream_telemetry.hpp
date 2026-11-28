@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,33 @@ inline uint64_t steady_now_us() {
     using namespace std::chrono;
     return static_cast<uint64_t>(duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count());
 }
+
+/**
+ * Shared wall-clock origin anchored on the first appended media packet (audio or video)
+ * so both EMSS tracks share a single 0.0s timeline despite startup resync offsets.
+ */
+class SharedMediaClock {
+public:
+    void reset() {
+        origin_us_.store(0, std::memory_order_release);
+    }
+
+    int64_t elapsed_us(uint64_t wall_us) {
+        if (wall_us == 0) wall_us = 1;
+        uint64_t expected = 0;
+        if (!origin_us_.compare_exchange_strong(expected, wall_us, std::memory_order_acq_rel)) {
+            return wall_us >= expected ? static_cast<int64_t>(wall_us - expected) : 0;
+        }
+        return 0;
+    }
+
+    bool is_started() const {
+        return origin_us_.load(std::memory_order_acquire) != 0;
+    }
+
+private:
+    std::atomic<uint64_t> origin_us_{0};
+};
 
 struct LatencySnapshot {
     uint32_t count = 0;

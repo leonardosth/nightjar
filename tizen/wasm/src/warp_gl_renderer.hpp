@@ -30,6 +30,7 @@ public:
     ~WarpGlRenderer();
 
     bool init(int width, int height);
+    bool make_current();
     void resize(int width, int height);
     void set_picture_crop(uint32_t picture_w, uint32_t picture_h, uint32_t coded_w, uint32_t coded_h);
     void sync_hud_mask(frame_warp::FrameWarp& warp);

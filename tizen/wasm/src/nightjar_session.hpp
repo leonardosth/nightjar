@@ -158,6 +158,7 @@ private:
     StreamOptions opts_;
     int host_frame_warp_version_ = 0;
     std::shared_ptr<frame_warp::FrameWarp> warp_;
+    std::shared_ptr<SharedMediaClock> media_clock_;
     std::unique_ptr<TizenVideoDecoder> decoder_;
     std::unique_ptr<TizenAudioDecoder> audio_decoder_;
     WarpGlRenderer renderer_;

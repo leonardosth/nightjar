@@ -173,6 +173,14 @@ bool WarpGlRenderer::init(int width, int height) {
 #endif
 }
 
+bool WarpGlRenderer::make_current() {
+#ifdef __EMSCRIPTEN__
+    return webgl_ctx_ > 0 && emscripten_webgl_make_context_current(webgl_ctx_) == EMSCRIPTEN_RESULT_SUCCESS;
+#else
+    return true;
+#endif
+}
+
 void WarpGlRenderer::resize(int width, int height) {
 #ifdef __EMSCRIPTEN__
     viewport_w_ = width;

@@ -28,8 +28,10 @@ struct VideoConfig {
     bool hdr10 = false;
     bool use_video_texture = true;
     std::function<void()> on_need_idr;
+    std::function<void()> on_before_register_gl;
     // Invoked on the main thread when EMSS transitions kDetached -> kClosed (safe to call AddTrack).
     std::function<void(void* emss_source_ptr)> on_source_ready_for_tracks;
+    std::shared_ptr<SharedMediaClock> media_clock;
 };
 
 /**
@@ -102,7 +104,8 @@ public:
     void open_source();
     bool register_gl_context();
     void attach_texture_ring(std::array<GLuint, 3> textures);
-    bool submit_access_unit(const uint8_t* data, size_t size, uint32_t frame_number, int64_t pts_us, bool keyframe);
+    bool submit_access_unit(
+        const uint8_t* data, size_t size, uint32_t frame_number, int64_t pts_us, bool keyframe, uint64_t wall_now_us = 0);
 
     // Drives async FillTextureWithNextFrame into a Free slot and promotes Ready frames.
     // Resolves frame identity via GetCurrentTime() + PendingFrameQueue FIFO fallback.
@@ -117,7 +120,8 @@ public:
     uint32_t append_errors() const { return append_err_total_.load(std::memory_order_relaxed); }
 
     void* emss_source() const;
-    bool is_direct_scanout() const { return !config_.use_video_texture; }
+    bool is_direct_scanout() const { return direct_scanout_.load(std::memory_order_acquire); }
+    bool video_texture_rejected() const { return vt_rejected_.load(std::memory_order_acquire); }
     std::string diagnostic_summary() const;
 
     void shutdown();
@@ -127,6 +131,7 @@ private:
     void reset_pts_origin();
 
     std::shared_ptr<frame_warp::FrameWarp> warp_;
+    std::shared_ptr<SharedMediaClock> media_clock_;
     VideoConfig config_;
     bool initialized_ = false;
     uint64_t submitted_packets_ = 0;
@@ -134,7 +139,11 @@ private:
     bool has_pts_origin_ = false;
     int64_t pts_origin_us_ = 0;
     uint64_t wall_origin_us_ = 0;
+    int64_t pts_base_us_ = 0;
     int64_t last_pts_us_ = 0;
+    std::atomic<bool> direct_scanout_{false};
+    std::atomic<bool> vt_rejected_{false};
+    std::atomic<bool> wait_keyframe_{false};
     std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
     TextureRing ring_;
     PendingFrameQueue pending_;

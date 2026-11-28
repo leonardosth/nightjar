@@ -276,6 +276,74 @@ int main() {
         dec.shutdown();
     }
 
+    // 17. build_video_track_candidates preserves 4K resolution on 120->60 step-down and never emits Level-4.0 1080p MIME for 4K
+    {
+        auto c4k = build_video_track_candidates("av1", 3840, 2160, 120, false);
+        assert(c4k.size() == 2);
+        assert(c4k[0].mime == "video/mp4; codecs=\"av01.0.13M.08\"" && c4k[0].fps == 120u && c4k[0].width == 3840u);
+        assert(c4k[1].mime == "video/mp4; codecs=\"av01.0.12M.08\"" && c4k[1].fps == 60u && c4k[1].width == 3840u);
+
+        auto c1080 = build_video_track_candidates("av1", 1920, 1080, 120, false);
+        assert(c1080.size() == 2);
+        assert(c1080[0].mime == "video/mp4; codecs=\"av01.0.09M.08\"" && c1080[0].fps == 120u);
+        assert(c1080[1].mime == "video/mp4; codecs=\"av01.0.08M.08\"" && c1080[1].fps == 60u);
+
+        auto chevc4k = build_video_track_candidates("hevc", 3840, 2160, 120, false);
+        assert(chevc4k.size() == 2);
+        assert(chevc4k[0].mime == "video/mp4; codecs=\"hev1.1.6.L156.B0\"" && chevc4k[0].fps == 120u);
+        assert(chevc4k[1].mime == "video/mp4; codecs=\"hev1.1.6.L153.B0\"" && chevc4k[1].fps == 60u);
+    }
+
+    // 18. SharedMediaClock synchronizes A/V startup, clamps audio bursts >40ms, and rebases drifted video PTS
+    {
+        auto clock = std::make_shared<SharedMediaClock>();
+        auto fw = std::make_shared<FrameWarp>(0, 1024);
+
+        TizenAudioDecoder audio;
+        assert(audio.open_track_on_main_thread(48000, false, nullptr));
+        AudioConfig acfg;
+        acfg.sample_rate = 48000;
+        acfg.channel_count = 2;
+        acfg.samples_per_frame = 240; // 5ms per packet
+        assert(audio.reconfigure_opus(acfg));
+        audio.set_media_clock(clock);
+
+        TizenVideoDecoder dec(fw);
+        VideoConfig vcfg;
+        vcfg.codec = "av1";
+        vcfg.width = 3840;
+        vcfg.height = 2160;
+        vcfg.fps = 120;
+        vcfg.use_video_texture = true;
+        vcfg.media_clock = clock;
+        assert(dec.initialize(vcfg));
+
+        const uint8_t fake_opus[4] = {1, 2, 3, 4};
+        // Audio starts at wall=1,000,000 us and submits 10 burst packets (50ms audio while wall only advanced 0ms)
+        for (int i = 0; i < 10; ++i) {
+            audio.decode_and_play(fake_opus, sizeof(fake_opus), 1000000ull);
+        }
+        // Lead > 40ms must drop excess burst packet(s) instead of pushing EMSS clock too far ahead
+        assert(audio.audio_dropped() >= 1u);
+
+        // First video frame arrives 300ms after audio started (e.g. TrackOpen IDR wait): anchored at 300ms, NOT 0ms!
+        const uint8_t au[4] = {0x12, 0x00, 0x01, 0x02};
+        assert(dec.submit_access_unit(au, sizeof(au), 50, 900000, true, 1300000ull));
+        assert(fw->lookup_frame_pts_nearest(300000, 500) == 50u);
+
+        // If audio arrives after a >40ms silence gap (at wall=1,400,000 -> elapsed=400ms), it jumps forward
+        audio.decode_and_play(fake_opus, sizeof(fake_opus), 1400000ull);
+        assert(audio.audio_gaps() >= 1u);
+        assert(audio.current_pts_sec() >= 0.400);
+
+        // If host video PTS claims +200ms delta while wall clock only elapsed +100ms, 40ms clamp rebases to wall
+        assert(dec.submit_access_unit(au, sizeof(au), 51, 1100000, false, 1400000ull));
+        assert(fw->lookup_frame_pts_nearest(400000, 1000) == 51u);
+
+        audio.shutdown();
+        dec.shutdown();
+    }
+
     // 14. TizenAudioDecoder::open_track_on_main_thread and reconfigure_opus are split cleanly
     {
         TizenAudioDecoder audio;

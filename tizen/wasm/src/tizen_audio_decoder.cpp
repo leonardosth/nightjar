@@ -50,11 +50,21 @@ struct TizenAudioDecoder::Impl
 TizenAudioDecoder::TizenAudioDecoder() : impl_(std::make_unique<Impl>()) {}
 TizenAudioDecoder::~TizenAudioDecoder() { shutdown(); }
 
+void TizenAudioDecoder::set_media_clock(std::shared_ptr<SharedMediaClock> clock) {
+    clock_ = std::move(clock);
+}
+
 bool TizenAudioDecoder::open_track_on_main_thread(int sample_rate, bool surround51, void* emss_source_ptr) {
     if (sample_rate <= 0) return false;
     cfg_.sample_rate = sample_rate;
     cfg_.channel_count = surround51 ? 6 : 2;
     samples_submitted_.store(0, std::memory_order_release);
+    has_audio_pts_ = false;
+    next_audio_pts_us_ = 0;
+    audio_pts_us_.store(0, std::memory_order_release);
+    audio_gaps_.store(0, std::memory_order_relaxed);
+    audio_dropped_.store(0, std::memory_order_relaxed);
+    audio_lead_ms_.store(0, std::memory_order_relaxed);
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     if (emss_source_ptr != nullptr) {
@@ -89,6 +99,12 @@ bool TizenAudioDecoder::reconfigure_opus(const AudioConfig& cfg) {
     std::lock_guard<std::mutex> lk(impl_->opus_mu);
     cfg_ = cfg;
     samples_submitted_.store(0, std::memory_order_release);
+    has_audio_pts_ = false;
+    next_audio_pts_us_ = 0;
+    audio_pts_us_.store(0, std::memory_order_release);
+    audio_gaps_.store(0, std::memory_order_relaxed);
+    audio_dropped_.store(0, std::memory_order_relaxed);
+    audio_lead_ms_.store(0, std::memory_order_relaxed);
     pcm_buf_.assign(static_cast<size_t>(cfg_.samples_per_frame) * static_cast<size_t>(cfg_.channel_count), 0);
 
 #ifdef NIGHTJAR_HAVE_OPUS
@@ -121,7 +137,7 @@ bool TizenAudioDecoder::initialize(const AudioConfig& cfg, void* emss_source_ptr
     return reconfigure_opus(cfg);
 }
 
-void TizenAudioDecoder::decode_and_play(const uint8_t* opus_data, size_t opus_len) {
+void TizenAudioDecoder::decode_and_play(const uint8_t* opus_data, size_t opus_len, uint64_t wall_now_us) {
     if (!initialized_ || !opus_data || opus_len == 0) return;
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
@@ -144,14 +160,43 @@ void TizenAudioDecoder::decode_and_play(const uint8_t* opus_data, size_t opus_le
     if (decoded_samples <= 0) return;
 #endif
 
-    const uint64_t prev_samples = samples_submitted_.fetch_add(
-        static_cast<uint64_t>(decoded_samples),
-        std::memory_order_acq_rel);
+    constexpr int64_t kMaxBehindUs = 40000LL;
+    constexpr int64_t kMaxAheadUs = 40000LL;
+    const int64_t dur_us =
+        (static_cast<int64_t>(decoded_samples) * 1000000LL) / static_cast<int64_t>(cfg_.sample_rate);
+    int64_t packet_pts_us = 0;
+
+    if (clock_) {
+        const uint64_t w_now = wall_now_us ? wall_now_us : steady_now_us();
+        const int64_t now_us = clock_->elapsed_us(w_now);
+        if (!has_audio_pts_) {
+            next_audio_pts_us_ = now_us;
+            has_audio_pts_ = true;
+        } else if (next_audio_pts_us_ < now_us - kMaxBehindUs) {
+            next_audio_pts_us_ = now_us;
+            audio_gaps_.fetch_add(1u, std::memory_order_relaxed);
+        }
+        const int64_t lead_us = next_audio_pts_us_ - now_us;
+        audio_lead_ms_.store(static_cast<int>(lead_us / 1000LL), std::memory_order_relaxed);
+        if (lead_us > kMaxAheadUs) {
+            audio_dropped_.fetch_add(1u, std::memory_order_relaxed);
+            return;
+        }
+        packet_pts_us = next_audio_pts_us_;
+        next_audio_pts_us_ += dur_us;
+        audio_pts_us_.store(next_audio_pts_us_, std::memory_order_release);
+        samples_submitted_.fetch_add(static_cast<uint64_t>(decoded_samples), std::memory_order_acq_rel);
+    } else {
+        const uint64_t prev_samples = samples_submitted_.fetch_add(
+            static_cast<uint64_t>(decoded_samples),
+            std::memory_order_acq_rel);
+        packet_pts_us = (static_cast<int64_t>(prev_samples) * 1000000LL) / static_cast<int64_t>(cfg_.sample_rate);
+        audio_pts_us_.store(packet_pts_us + dur_us, std::memory_order_release);
+    }
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
-    const double sr = static_cast<double>(cfg_.sample_rate);
-    samsung::wasm::Seconds pts(static_cast<double>(prev_samples) / sr);
-    samsung::wasm::Seconds dur(static_cast<double>(decoded_samples) / sr);
+    samsung::wasm::Seconds pts(static_cast<double>(packet_pts_us) / 1000000.0);
+    samsung::wasm::Seconds dur(static_cast<double>(dur_us) / 1000000.0);
     const size_t byte_len =
         static_cast<size_t>(decoded_samples) * static_cast<size_t>(cfg_.channel_count) * sizeof(int16_t);
 
@@ -169,13 +214,17 @@ void TizenAudioDecoder::decode_and_play(const uint8_t* opus_data, size_t opus_le
         impl_->session_id.load(std::memory_order_acquire),
     };
     (void)impl_->audio_track.AppendPacket(pkt);
-#else
-    (void)prev_samples;
 #endif
 }
 
 void TizenAudioDecoder::shutdown() {
     initialized_ = false;
+    has_audio_pts_ = false;
+    next_audio_pts_us_ = 0;
+    audio_pts_us_.store(0, std::memory_order_release);
+    audio_gaps_.store(0, std::memory_order_relaxed);
+    audio_dropped_.store(0, std::memory_order_relaxed);
+    audio_lead_ms_.store(0, std::memory_order_relaxed);
     if (!impl_) return;
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     if (impl_->has_track) {

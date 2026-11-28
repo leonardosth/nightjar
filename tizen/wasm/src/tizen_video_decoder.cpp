@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
 #include <samsung/html/html_media_element.h>
@@ -14,6 +15,10 @@
 #include <samsung/wasm/elementary_media_track_listener.h>
 #include <samsung/wasm/elementary_video_track_config.h>
 #include <samsung/wasm/operation_result.h>
+#if __has_include(<samsung/wasm/emss_version_info.h>)
+#include <samsung/wasm/emss_version_info.h>
+#define NIGHTJAR_HAVE_EMSS_VERSION_INFO 1
+#endif
 #endif
 
 namespace nightjar::tizen {
@@ -137,27 +142,42 @@ struct TizenVideoDecoder::Impl
     std::atomic<bool> track_open{false};
     bool has_track = false;
     bool use_video_texture = true;
+    bool tried_direct_fallback = false;
     std::string codec = "hevc";
     uint32_t width = 3840;
     uint32_t height = 2160;
     uint32_t fps = 60;
+    uint32_t accepted_track_fps = 60;
     bool hdr10 = false;
+    char latency_mode_char = 'L';
+    char render_mode_char = 'T';
+    int vi_vt = -1;
+    int vi_llvt = -1;
+    int vi_ull = -1;
     std::function<void()> on_need_idr;
+    std::function<void()> on_before_register_gl;
     std::function<void(void*)> on_source_ready_for_tracks;
     std::function<void()> on_track_closed;
     TextureRing* ring_ref = nullptr;
     PendingFrameQueue* pending_ref = nullptr;
+    std::atomic<bool>* direct_scanout_ref = nullptr;
+    std::atomic<bool>* vt_rejected_ref = nullptr;
+    std::atomic<bool>* wait_keyframe_ref = nullptr;
 
     // Live diagnostics surfaced in the TV overlay
     std::atomic<int> src_closed_count{0};
     std::atomic<int> open_pending_count{0};
+    std::atomic<int> primary_vtrack_op{-1};
     std::atomic<int> vtrack_op{-1};
     std::atomic<int> open_op{-1};
     std::atomic<int> play_op{-1};
     std::atomic<int> reg_gl_ok{-1};
+    std::atomic<int> reg_gl_op{-1};
     std::atomic<uint32_t> append_ok{0};
     std::atomic<uint32_t> append_err{0};
     std::atomic<int> last_append_op{-1};
+    std::atomic<uint32_t> async_append_err_count{0};
+    std::atomic<int> last_async_append_op{-1};
     std::atomic<int> last_fill_op{-1};
 
     void attach_tracks_and_open() {
@@ -165,32 +185,64 @@ struct TizenVideoDecoder::Impl
         src_closed_count.fetch_add(1, std::memory_order_relaxed);
         if (!has_track) {
             const uint32_t eff_fps = fps ? fps : 60u;
-            const std::string primary_mime = build_video_mime(codec, width, height, eff_fps, hdr10);
-            auto try_add = [&](const std::string& mime) {
-                return source->AddTrack(samsung::wasm::ElementaryVideoTrackConfig{
-                    mime,
+            const auto candidates = build_video_track_candidates(codec, width, height, eff_fps, hdr10);
+            samsung::wasm::Result<samsung::wasm::ElementaryMediaTrack> add_res{
+                samsung::wasm::OperationResult::kFailed, {}};
+            bool recorded_primary = false;
+            uint32_t chosen_fps = eff_fps;
+
+            for (const auto& c : candidates) {
+                add_res = source->AddTrack(samsung::wasm::ElementaryVideoTrackConfig{
+                    c.mime,
                     {},
-                    width,
-                    height,
-                    eff_fps,
+                    c.width,
+                    c.height,
+                    c.fps,
                     1u,
                 });
-            };
-            auto add_res = try_add(primary_mime);
-            if (!add_res) {
-                std::string fallback_mime = (codec == "av1")
-                    ? "video/mp4; codecs=\"av01.0.08M.08\""
-                    : (codec == "h264")
-                        ? "video/mp4; codecs=\"avc1.4d401f\""
-                        : "video/mp4; codecs=\"hev1.1.6.L93.B0\"";
-                if (fallback_mime != primary_mime) {
-                    add_res = try_add(fallback_mime);
+                if (!recorded_primary) {
+                    primary_vtrack_op.store(static_cast<int>(add_res.operation_result), std::memory_order_relaxed);
+                    recorded_primary = true;
+                }
+                vtrack_op.store(static_cast<int>(add_res.operation_result), std::memory_order_relaxed);
+                if (add_res) {
+                    chosen_fps = c.fps;
+                    break;
                 }
             }
-            vtrack_op.store(static_cast<int>(add_res.operation_result), std::memory_order_relaxed);
+
             if (!add_res) {
+                if (use_video_texture && !tried_direct_fallback) {
+                    tried_direct_fallback = true;
+                    use_video_texture = false;
+                    render_mode_char = 'M';
+                    if (vt_rejected_ref) vt_rejected_ref->store(true, std::memory_order_release);
+                    if (direct_scanout_ref) direct_scanout_ref->store(true, std::memory_order_release);
+                    if (source) {
+                        source->SetListener(nullptr);
+                    }
+                    if (media_element) {
+                        media_element->SetSrc(static_cast<samsung::wasm::ElementaryMediaStreamSource*>(nullptr));
+                    }
+                    using LatencyMode = samsung::wasm::ElementaryMediaStreamSource::LatencyMode;
+                    using RenderingMode = samsung::wasm::ElementaryMediaStreamSource::RenderingMode;
+                    source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(
+                        LatencyMode::kLow, RenderingMode::kMediaElement);
+                    latency_mode_char = 'L';
+                    if (!source->IsValid()) {
+                        source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(
+                            LatencyMode::kNormal, RenderingMode::kMediaElement);
+                        latency_mode_char = 'N';
+                    }
+                    if (source->IsValid() && media_element) {
+                        source->SetListener(this);
+                        media_element->SetSrc(source.get());
+                    }
+                }
                 return;
             }
+
+            accepted_track_fps = chosen_fps;
             video_track = std::move(add_res.value);
             video_track.SetListener(this);
             has_track = true;
@@ -199,8 +251,12 @@ struct TizenVideoDecoder::Impl
                 on_source_ready_for_tracks(static_cast<void*>(source.get()));
             }
             if (use_video_texture) {
+                if (on_before_register_gl) {
+                    on_before_register_gl();
+                }
                 auto rg = video_track.RegisterCurrentGraphicsContext();
                 reg_gl_ok.store(rg ? 1 : 0, std::memory_order_relaxed);
+                reg_gl_op.store(static_cast<int>(rg.operation_result), std::memory_order_relaxed);
             }
         }
         source->Open([this](samsung::wasm::OperationResult r) {
@@ -225,11 +281,13 @@ struct TizenVideoDecoder::Impl
 
     void OnTrackOpen() override {
         track_open.store(true, std::memory_order_release);
+        if (wait_keyframe_ref) wait_keyframe_ref->store(true, std::memory_order_release);
         if (on_need_idr) on_need_idr();
     }
 
     void OnTrackClosed(samsung::wasm::ElementaryMediaTrack::CloseReason) override {
         track_open.store(false, std::memory_order_release);
+        if (wait_keyframe_ref) wait_keyframe_ref->store(true, std::memory_order_release);
         if (ring_ref) ring_ref->reset();
         if (pending_ref) pending_ref->clear();
         if (on_track_closed) on_track_closed();
@@ -237,8 +295,18 @@ struct TizenVideoDecoder::Impl
 
     void OnSessionIdChanged(samsung::wasm::SessionId new_id) override {
         session_id.store(new_id, std::memory_order_release);
+        if (wait_keyframe_ref) wait_keyframe_ref->store(true, std::memory_order_release);
         if (track_open.load(std::memory_order_acquire) && on_need_idr) {
             on_need_idr();
+        }
+    }
+
+    void OnAppendError(samsung::wasm::OperationResult r) override {
+        async_append_err_count.fetch_add(1u, std::memory_order_relaxed);
+        last_async_append_op.store(static_cast<int>(r), std::memory_order_relaxed);
+        if (r == samsung::wasm::OperationResult::kAppendExpectsKeyframe && wait_keyframe_ref) {
+            wait_keyframe_ref->store(true, std::memory_order_release);
+            if (on_need_idr) on_need_idr();
         }
     }
 };
@@ -258,6 +326,7 @@ void TizenVideoDecoder::reset_pts_origin() {
     has_pts_origin_ = false;
     pts_origin_us_ = 0;
     wall_origin_us_ = 0;
+    pts_base_us_ = 0;
     last_pts_us_ = 0;
 }
 
@@ -265,6 +334,10 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_e
     shutdown();
     alive_ = std::make_shared<std::atomic<bool>>(true);
     config_ = config;
+    media_clock_ = config.media_clock;
+    direct_scanout_.store(!config.use_video_texture, std::memory_order_release);
+    vt_rejected_.store(false, std::memory_order_release);
+    wait_keyframe_.store(false, std::memory_order_release);
     submitted_packets_ = 0;
     reset_pts_origin();
     pending_.clear();
@@ -279,27 +352,58 @@ bool TizenVideoDecoder::initialize(const VideoConfig& config, std::string* out_e
     using RenderingMode = samsung::wasm::ElementaryMediaStreamSource::RenderingMode;
 
     impl_->on_need_idr = config.on_need_idr;
+    impl_->on_before_register_gl = config.on_before_register_gl;
     impl_->on_source_ready_for_tracks = config.on_source_ready_for_tracks;
     impl_->on_track_closed = [this]() { reset_pts_origin(); };
     impl_->ring_ref = &ring_;
     impl_->pending_ref = &pending_;
+    impl_->direct_scanout_ref = &direct_scanout_;
+    impl_->vt_rejected_ref = &vt_rejected_;
+    impl_->wait_keyframe_ref = &wait_keyframe_;
+    impl_->tried_direct_fallback = false;
     impl_->use_video_texture = config.use_video_texture;
     impl_->codec = config.codec;
     impl_->width = config.width;
     impl_->height = config.height;
     impl_->fps = config.fps ? config.fps : 60u;
+    impl_->accepted_track_fps = impl_->fps;
     impl_->hdr10 = config.hdr10;
+    impl_->render_mode_char = config.use_video_texture ? 'T' : 'M';
+    impl_->src_closed_count.store(0, std::memory_order_relaxed);
+    impl_->open_pending_count.store(0, std::memory_order_relaxed);
+    impl_->primary_vtrack_op.store(-1, std::memory_order_relaxed);
+    impl_->vtrack_op.store(-1, std::memory_order_relaxed);
+    impl_->open_op.store(-1, std::memory_order_relaxed);
+    impl_->play_op.store(-1, std::memory_order_relaxed);
+    impl_->reg_gl_ok.store(-1, std::memory_order_relaxed);
+    impl_->reg_gl_op.store(-1, std::memory_order_relaxed);
+    impl_->append_ok.store(0, std::memory_order_relaxed);
+    impl_->append_err.store(0, std::memory_order_relaxed);
+    impl_->last_append_op.store(-1, std::memory_order_relaxed);
+    impl_->async_append_err_count.store(0, std::memory_order_relaxed);
+    impl_->last_async_append_op.store(-1, std::memory_order_relaxed);
+    impl_->last_fill_op.store(-1, std::memory_order_relaxed);
+
+#ifdef NIGHTJAR_HAVE_EMSS_VERSION_INFO
+    {
+        auto vi = samsung::wasm::EmssVersionInfo::Create();
+        impl_->vi_vt = vi.has_video_texture ? 1 : 0;
+        impl_->vi_llvt = vi.has_low_latency_video_texture ? 1 : 0;
+        impl_->vi_ull = vi.has_ultra_low_latency ? 1 : 0;
+    }
+#endif
+
     impl_->media_element = std::make_unique<samsung::html::HTMLMediaElement>("tizen-video-sink");
     const RenderingMode rmode = config.use_video_texture
         ? RenderingMode::kVideoTexture
         : RenderingMode::kMediaElement;
 
-    impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kUltraLow, rmode);
-    if (!impl_->source->IsValid()) {
-        impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kLow, rmode);
-    }
+    // Tizen 9/10 freezes or drops heavily with kUltraLow; kLow delivers zero-buffer low latency reliably.
+    impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kLow, rmode);
+    impl_->latency_mode_char = 'L';
     if (!impl_->source->IsValid()) {
         impl_->source = std::make_unique<samsung::wasm::ElementaryMediaStreamSource>(LatencyMode::kNormal, rmode);
+        impl_->latency_mode_char = 'N';
     }
 
     const bool src_valid = impl_->source->IsValid();
@@ -346,7 +450,7 @@ void TizenVideoDecoder::attach_texture_ring(std::array<GLuint, 3> textures) {
 }
 
 bool TizenVideoDecoder::register_gl_context() {
-    if (!initialized_ || !config_.use_video_texture) return true;
+    if (!initialized_ || is_direct_scanout()) return true;
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     if (!impl_->has_track) return false;
     return static_cast<bool>(impl_->video_track.RegisterCurrentGraphicsContext());
@@ -356,7 +460,7 @@ bool TizenVideoDecoder::register_gl_context() {
 }
 
 bool TizenVideoDecoder::submit_access_unit(
-    const uint8_t* data, size_t size, uint32_t frame_number, int64_t pts_us, bool keyframe) {
+    const uint8_t* data, size_t size, uint32_t frame_number, int64_t pts_us, bool keyframe, uint64_t wall_now_us) {
     if (!initialized_ || !data || size == 0) return false;
 
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
@@ -365,32 +469,52 @@ bool TizenVideoDecoder::submit_access_unit(
     }
 #endif
 
-    // Anchor video PTS at 0.0s (matching the Opus audio track) using real host frame timing
-    // so variable-FPS games (e.g. 85 fps inside a 120 fps stream) never drift behind audio.
+    if (wait_keyframe_.load(std::memory_order_acquire)) {
+        if (!keyframe) {
+            return true;
+        }
+        wait_keyframe_.store(false, std::memory_order_release);
+    }
+
+    // Anchor video PTS onto the shared A/V wall clock using real host frame timing
+    // and rebase if clock drift exceeds 40 ms so video never falls behind audio on EMSS.
     const uint32_t fps = config_.fps ? config_.fps : 60u;
-    const int64_t frame_dur_us = 1000000LL / static_cast<int64_t>(fps);
-    const uint64_t now_wall_us = steady_now_us();
+#if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
+    const uint32_t track_fps = impl_->accepted_track_fps ? impl_->accepted_track_fps : fps;
+#else
+    const uint32_t track_fps = fps;
+#endif
+    const int64_t frame_dur_us = 1000000LL / static_cast<int64_t>(track_fps);
+    const uint64_t now_wall_us = wall_now_us ? wall_now_us : steady_now_us();
+    const int64_t wall_elapsed_us = media_clock_ ? media_clock_->elapsed_us(now_wall_us) : -1;
     int64_t effective_pts_us = 0;
-    int64_t pkt_dur_us = frame_dur_us;
     {
         std::lock_guard<std::mutex> lk(pts_mu_);
         if (!has_pts_origin_) {
             has_pts_origin_ = true;
             pts_origin_us_ = pts_us;
             wall_origin_us_ = now_wall_us;
-            last_pts_us_ = 0;
-            effective_pts_us = 0;
+            pts_base_us_ = (wall_elapsed_us >= 0) ? wall_elapsed_us : 0;
+            effective_pts_us = pts_base_us_;
+            last_pts_us_ = effective_pts_us;
         } else {
             int64_t candidate_us = 0;
             if (pts_us > pts_origin_us_) {
-                candidate_us = pts_us - pts_origin_us_;
+                candidate_us = pts_base_us_ + (pts_us - pts_origin_us_);
+            } else if (wall_elapsed_us >= 0) {
+                candidate_us = wall_elapsed_us;
             } else if (now_wall_us > wall_origin_us_) {
-                candidate_us = static_cast<int64_t>(now_wall_us - wall_origin_us_);
+                candidate_us = pts_base_us_ + static_cast<int64_t>(now_wall_us - wall_origin_us_);
             } else {
                 candidate_us = last_pts_us_ + frame_dur_us;
             }
+            if (wall_elapsed_us >= 0 && std::llabs(candidate_us - wall_elapsed_us) > 40000LL) {
+                pts_origin_us_ = pts_us;
+                wall_origin_us_ = now_wall_us;
+                pts_base_us_ = wall_elapsed_us;
+                candidate_us = wall_elapsed_us;
+            }
             effective_pts_us = std::max<int64_t>(last_pts_us_ + int64_t{500}, candidate_us);
-            pkt_dur_us = std::clamp<int64_t>(effective_pts_us - last_pts_us_, 1000LL, 100000LL);
             last_pts_us_ = effective_pts_us;
         }
     }
@@ -400,9 +524,10 @@ bool TizenVideoDecoder::submit_access_unit(
         warp_->note_frame_pts(effective_pts_us, frame_number);
     }
 
+    const bool direct_now = is_direct_scanout();
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     samsung::wasm::Seconds pts(static_cast<double>(effective_pts_us) / 1000000.0);
-    samsung::wasm::Seconds dur(static_cast<double>(pkt_dur_us) / 1000000.0);
+    samsung::wasm::Seconds dur(static_cast<double>(frame_dur_us) / 1000000.0);
     samsung::wasm::ElementaryMediaPacket pkt{
         pts,
         pts,
@@ -412,7 +537,7 @@ bool TizenVideoDecoder::submit_access_unit(
         data,
         config_.width,
         config_.height,
-        fps,
+        track_fps,
         1u,
         impl_->session_id.load(std::memory_order_acquire),
     };
@@ -420,17 +545,20 @@ bool TizenVideoDecoder::submit_access_unit(
     impl_->last_append_op.store(static_cast<int>(ap_res.operation_result), std::memory_order_relaxed);
     if (ap_res) {
         impl_->append_ok.fetch_add(1u, std::memory_order_relaxed);
-        if (config_.use_video_texture) {
+        if (!direct_now) {
             pending_.push(PendingFrameQueue::Entry{frame_number, effective_pts_us, steady_now_us()});
         }
         return true;
     }
     impl_->append_err.fetch_add(1u, std::memory_order_relaxed);
     append_err_total_.fetch_add(1u, std::memory_order_relaxed);
+    if (ap_res.operation_result == samsung::wasm::OperationResult::kAppendExpectsKeyframe) {
+        wait_keyframe_.store(true, std::memory_order_release);
+    }
     return false;
 #else
     (void)keyframe;
-    if (config_.use_video_texture) {
+    if (!direct_now) {
         pending_.push(PendingFrameQueue::Entry{frame_number, effective_pts_us, steady_now_us()});
     }
     return true;
@@ -439,7 +567,7 @@ bool TizenVideoDecoder::submit_access_unit(
 
 void TizenVideoDecoder::kick_fill() {
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
-    if (!initialized_ || !config_.use_video_texture) return;
+    if (!initialized_ || is_direct_scanout()) return;
     if (!impl_->has_track || !impl_->track_open.load(std::memory_order_acquire)) return;
     if (auto slot = ring_.acquire_for_fill()) {
         GLuint fill_tex = ring_.texture_at(*slot);
@@ -499,7 +627,7 @@ void TizenVideoDecoder::kick_fill() {
 
 bool TizenVideoDecoder::poll_next_frame(
     GLuint& out_tex, uint32_t& out_frame, bool& out_tagged, uint64_t* out_filled_us) {
-    if (!initialized_ || !config_.use_video_texture) return false;
+    if (!initialized_ || is_direct_scanout()) return false;
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     if (!impl_->has_track || !impl_->track_open.load(std::memory_order_acquire)) return false;
 
@@ -528,9 +656,15 @@ bool TizenVideoDecoder::poll_next_frame(
 std::string TizenVideoDecoder::diagnostic_summary() const {
 #if defined(__EMSCRIPTEN__) && defined(TIZEN_WASM_SDK)
     if (!impl_) return "no-impl";
-    return "sc=" + std::to_string(impl_->src_closed_count.load(std::memory_order_relaxed)) +
+    return std::string("lm=") + impl_->latency_mode_char +
+           " rm=" + impl_->render_mode_char +
+           " vi=" + std::to_string(impl_->vi_vt) + std::to_string(impl_->vi_llvt) + std::to_string(impl_->vi_ull) +
+           " sc=" + std::to_string(impl_->src_closed_count.load(std::memory_order_relaxed)) +
+           " vt1=" + std::to_string(impl_->primary_vtrack_op.load(std::memory_order_relaxed)) +
            " vt=" + std::to_string(impl_->vtrack_op.load(std::memory_order_relaxed)) +
+           " tf=" + std::to_string(impl_->accepted_track_fps) +
            " gl=" + std::to_string(impl_->reg_gl_ok.load(std::memory_order_relaxed)) +
+           "(" + std::to_string(impl_->reg_gl_op.load(std::memory_order_relaxed)) + ")" +
            " op=" + std::to_string(impl_->open_op.load(std::memory_order_relaxed)) +
            " pd=" + std::to_string(impl_->open_pending_count.load(std::memory_order_relaxed)) +
            " pl=" + std::to_string(impl_->play_op.load(std::memory_order_relaxed)) +
@@ -538,6 +672,8 @@ std::string TizenVideoDecoder::diagnostic_summary() const {
            " ap=" + std::to_string(impl_->append_ok.load(std::memory_order_relaxed)) +
            "/" + std::to_string(impl_->append_err.load(std::memory_order_relaxed)) +
            "(" + std::to_string(impl_->last_append_op.load(std::memory_order_relaxed)) + ")" +
+           " ae=" + std::to_string(impl_->async_append_err_count.load(std::memory_order_relaxed)) +
+           "(" + std::to_string(impl_->last_async_append_op.load(std::memory_order_relaxed)) + ")" +
            " fl=" + std::to_string(impl_->last_fill_op.load(std::memory_order_relaxed)) +
            " dq=" + std::to_string(pending_.size());
 #else

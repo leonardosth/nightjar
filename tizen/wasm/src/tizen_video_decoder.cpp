@@ -186,13 +186,12 @@ struct TizenVideoDecoder::Impl
         if (!has_track) {
             const uint32_t eff_fps = fps ? fps : 60u;
             const auto candidates = build_video_track_candidates(codec, width, height, eff_fps, hdr10);
-            samsung::wasm::Result<samsung::wasm::ElementaryMediaTrack> add_res{
-                samsung::wasm::OperationResult::kFailed, {}};
             bool recorded_primary = false;
+            bool track_ok = false;
             uint32_t chosen_fps = eff_fps;
 
             for (const auto& c : candidates) {
-                add_res = source->AddTrack(samsung::wasm::ElementaryVideoTrackConfig{
+                auto add_res = source->AddTrack(samsung::wasm::ElementaryVideoTrackConfig{
                     c.mime,
                     {},
                     c.width,
@@ -207,11 +206,15 @@ struct TizenVideoDecoder::Impl
                 vtrack_op.store(static_cast<int>(add_res.operation_result), std::memory_order_relaxed);
                 if (add_res) {
                     chosen_fps = c.fps;
+                    video_track = std::move(add_res.value);
+                    video_track.SetListener(this);
+                    has_track = true;
+                    track_ok = true;
                     break;
                 }
             }
 
-            if (!add_res) {
+            if (!track_ok) {
                 if (use_video_texture && !tried_direct_fallback) {
                     tried_direct_fallback = true;
                     use_video_texture = false;
@@ -243,9 +246,6 @@ struct TizenVideoDecoder::Impl
             }
 
             accepted_track_fps = chosen_fps;
-            video_track = std::move(add_res.value);
-            video_track.SetListener(this);
-            has_track = true;
 
             if (on_source_ready_for_tracks) {
                 on_source_ready_for_tracks(static_cast<void*>(source.get()));
